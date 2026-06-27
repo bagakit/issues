@@ -1,6 +1,5 @@
-.worktrees
-.bagakit
-.bagaki*
-.codex
-.claude
-.agents
+.worktrees/
+.bagakit/
+.codex/
+.claude/
+.agents/

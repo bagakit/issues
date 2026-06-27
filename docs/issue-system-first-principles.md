@@ -16,6 +16,9 @@ Build a standalone issue system that feels like GitHub Issues to humans and
 coding agents, while remaining local-first and reusable outside any one UI.
 Karp is a client and dispatch surface. It does not own issue truth.
 
+See `docs/issue-core-contracts.md` for the concrete package, adapter, context,
+and dispatch contract split used by the current implementation.
+
 ## Background
 
 Karp needs a lightweight way to capture requirements and dispatch them into

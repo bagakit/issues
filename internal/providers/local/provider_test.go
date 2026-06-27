@@ -1,0 +1,307 @@
+package local
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"path/filepath"
+	"reflect"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/bagakit/issues/pkg/issuecore"
+)
+
+func TestProviderCRUDAndDeterministicExport(t *testing.T) {
+	t.Parallel()
+
+	provider := newTestProvider(t)
+	ctx := context.Background()
+
+	first, err := provider.CreateIssue(ctx, issuecore.CreateIssueInput{
+		Repository: "bagakit/issues",
+		Title:      "first",
+		Body:       "alpha body",
+		Labels:     []string{"zeta", "alpha"},
+		Assignees:  []string{"bob", "alice"},
+	})
+	if err != nil {
+		t.Fatalf("create first issue: %v", err)
+	}
+	if first.ID != "local-issue-000001" || first.Number != 1 {
+		t.Fatalf("unexpected first issue identity: %+v", first)
+	}
+	if got := labelNames(first.Labels); !reflect.DeepEqual(got, []string{"alpha", "zeta"}) {
+		t.Fatalf("unexpected first issue labels: %#v", got)
+	}
+	if got := assigneeLogins(first.Assignees); !reflect.DeepEqual(got, []string{"alice", "bob"}) {
+		t.Fatalf("unexpected first issue assignees: %#v", got)
+	}
+
+	second, err := provider.CreateIssue(ctx, issuecore.CreateIssueInput{
+		Repository: "bagakit/issues",
+		Title:      "second",
+		Body:       "beta body",
+	})
+	if err != nil {
+		t.Fatalf("create second issue: %v", err)
+	}
+	if second.ID != "local-issue-000002" || second.Number != 2 {
+		t.Fatalf("unexpected second issue identity: %+v", second)
+	}
+
+	page, err := provider.ListIssues(ctx, issuecore.ListIssuesQuery{
+		Repository: "bagakit/issues",
+		State:      issuecore.IssueStateFilterAll,
+	})
+	if err != nil {
+		t.Fatalf("list issues: %v", err)
+	}
+	if got := []int{page.Issues[0].Number, page.Issues[1].Number}; !reflect.DeepEqual(got, []int{2, 1}) {
+		t.Fatalf("unexpected list order: %#v", got)
+	}
+
+	updated, err := provider.UpdateIssue(ctx, issuecore.IssueLocator{Number: 1, Repository: "bagakit/issues"}, issuecore.IssuePatch{
+		Title:     stringPtr("first updated"),
+		Body:      stringPtr("alpha body updated"),
+		Labels:    slicePtr([]string{"beta", "alpha"}),
+		Assignees: slicePtr([]string{"alice"}),
+	})
+	if err != nil {
+		t.Fatalf("update issue: %v", err)
+	}
+	if updated.Title != "first updated" || updated.Body != "alpha body updated" {
+		t.Fatalf("unexpected updated issue: %+v", updated)
+	}
+	if got := labelNames(updated.Labels); !reflect.DeepEqual(got, []string{"alpha", "beta"}) {
+		t.Fatalf("unexpected updated labels: %#v", got)
+	}
+	if got := assigneeLogins(updated.Assignees); !reflect.DeepEqual(got, []string{"alice"}) {
+		t.Fatalf("unexpected updated assignees: %#v", got)
+	}
+
+	comment, err := provider.AddComment(ctx, issuecore.IssueLocator{Number: 1, Repository: "bagakit/issues"}, issuecore.AddCommentInput{
+		Body: "first comment",
+	})
+	if err != nil {
+		t.Fatalf("add comment: %v", err)
+	}
+	if comment.ID != "local-comment-000001" {
+		t.Fatalf("unexpected comment identity: %+v", comment)
+	}
+
+	closed, err := provider.CloseIssue(ctx, issuecore.IssueLocator{Number: 1, Repository: "bagakit/issues"}, issuecore.CloseIssueInput{
+		Reason: issuecore.IssueStateReasonNotPlanned,
+	})
+	if err != nil {
+		t.Fatalf("close issue: %v", err)
+	}
+	if closed.State != issuecore.IssueStateClosed || closed.StateReason != issuecore.IssueStateReasonNotPlanned {
+		t.Fatalf("unexpected closed issue: %+v", closed)
+	}
+
+	reopened, err := provider.ReopenIssue(ctx, issuecore.IssueLocator{Number: 1, Repository: "bagakit/issues"}, issuecore.ReopenIssueInput{})
+	if err != nil {
+		t.Fatalf("reopen issue: %v", err)
+	}
+	if reopened.State != issuecore.IssueStateOpen || reopened.StateReason != issuecore.IssueStateReasonReopened {
+		t.Fatalf("unexpected reopened issue: %+v", reopened)
+	}
+
+	gotIssue, err := provider.GetIssue(ctx, issuecore.IssueLocator{Number: 1, Repository: "bagakit/issues"})
+	if err != nil {
+		t.Fatalf("get issue: %v", err)
+	}
+	if gotIssue.Comments != 1 || len(gotIssue.CommentItems) != 1 {
+		t.Fatalf("unexpected comment counts: %+v", gotIssue)
+	}
+	if got := timelineKinds(gotIssue.Timeline); !reflect.DeepEqual(got, []string{"created", "updated", "closed", "reopened"}) {
+		t.Fatalf("unexpected timeline kinds: %#v", got)
+	}
+
+	filtered, err := provider.ListIssues(ctx, issuecore.ListIssuesQuery{
+		Repository: "bagakit/issues",
+		State:      issuecore.IssueStateFilterAll,
+		Labels:     []string{"alpha", "beta"},
+		Assignee:   "alice",
+		Search:     "updated",
+	})
+	if err != nil {
+		t.Fatalf("filtered list: %v", err)
+	}
+	if len(filtered.Issues) != 1 || filtered.Issues[0].Number != 1 {
+		t.Fatalf("unexpected filtered issues: %+v", filtered.Issues)
+	}
+
+	exportOne, err := provider.ExportJSON(ctx)
+	if err != nil {
+		t.Fatalf("export json first pass: %v", err)
+	}
+	exportTwo, err := provider.ExportJSON(ctx)
+	if err != nil {
+		t.Fatalf("export json second pass: %v", err)
+	}
+	if !bytes.Equal(exportOne, exportTwo) {
+		t.Fatalf("export bytes not deterministic\nfirst:\n%s\nsecond:\n%s", exportOne, exportTwo)
+	}
+
+	var snapshot Snapshot
+	if err := json.Unmarshal(exportOne, &snapshot); err != nil {
+		t.Fatalf("decode export: %v", err)
+	}
+	if snapshot.SchemaVersion != 1 || snapshot.Provider != issuecore.ProviderLocal {
+		t.Fatalf("unexpected snapshot header: %+v", snapshot)
+	}
+	if got := []int{snapshot.Issues[0].Number, snapshot.Issues[1].Number}; !reflect.DeepEqual(got, []int{1, 2}) {
+		t.Fatalf("unexpected export issue order: %#v", got)
+	}
+	if got := labelNames(snapshot.Issues[0].Labels); !reflect.DeepEqual(got, []string{"alpha", "beta"}) {
+		t.Fatalf("unexpected exported labels: %#v", got)
+	}
+	if got := assigneeLogins(snapshot.Issues[0].Assignees); !reflect.DeepEqual(got, []string{"alice"}) {
+		t.Fatalf("unexpected exported assignees: %#v", got)
+	}
+	if len(snapshot.Events) != 6 {
+		t.Fatalf("unexpected event count: %d", len(snapshot.Events))
+	}
+	if got := eventKinds(snapshot.Events); !reflect.DeepEqual(got, []string{"created", "created", "updated", "commented", "closed", "reopened"}) {
+		t.Fatalf("unexpected event kinds: %#v", got)
+	}
+	if len(snapshot.ProviderRefs) != 0 {
+		t.Fatalf("expected no provider refs, got %+v", snapshot.ProviderRefs)
+	}
+}
+
+func TestProviderUpdateIssueRejectsEmptyPatchWithoutWrites(t *testing.T) {
+	t.Parallel()
+
+	provider := newTestProvider(t)
+	ctx := context.Background()
+
+	_, err := provider.CreateIssue(ctx, issuecore.CreateIssueInput{
+		Repository: "bagakit/issues",
+		Title:      "first",
+		Body:       "alpha body",
+	})
+	if err != nil {
+		t.Fatalf("create issue: %v", err)
+	}
+
+	beforeExport, err := provider.ExportJSON(ctx)
+	if err != nil {
+		t.Fatalf("export before empty update: %v", err)
+	}
+
+	var before Snapshot
+	if err := json.Unmarshal(beforeExport, &before); err != nil {
+		t.Fatalf("decode before export: %v", err)
+	}
+
+	_, err = provider.UpdateIssue(ctx, issuecore.IssueLocator{Number: 1, Repository: "bagakit/issues"}, issuecore.IssuePatch{})
+	if err == nil {
+		t.Fatalf("expected empty patch error")
+	}
+
+	var opErr *issuecore.OperationError
+	if !errors.As(err, &opErr) {
+		t.Fatalf("expected OperationError, got %T", err)
+	}
+	if opErr.Code != "invalid_argument" {
+		t.Fatalf("unexpected error code: %q", opErr.Code)
+	}
+	if opErr.Provider != issuecore.ProviderLocal {
+		t.Fatalf("unexpected provider: %q", opErr.Provider)
+	}
+	if opErr.Operation != "update" {
+		t.Fatalf("unexpected operation: %q", opErr.Operation)
+	}
+
+	afterExport, err := provider.ExportJSON(ctx)
+	if err != nil {
+		t.Fatalf("export after empty update: %v", err)
+	}
+
+	var after Snapshot
+	if err := json.Unmarshal(afterExport, &after); err != nil {
+		t.Fatalf("decode after export: %v", err)
+	}
+
+	if len(after.Events) != len(before.Events) {
+		t.Fatalf("event count changed: before=%d after=%d", len(before.Events), len(after.Events))
+	}
+	if !bytes.Equal(beforeExport, afterExport) {
+		t.Fatalf("export changed after empty update\nbefore:\n%s\nafter:\n%s", beforeExport, afterExport)
+	}
+}
+
+func newTestProvider(t *testing.T) *Provider {
+	t.Helper()
+
+	provider, err := New(Config{
+		Path: filepath.Join(t.TempDir(), "issues.db"),
+		Now:  sequentialClock(time.Date(2024, time.January, 2, 1, 0, 0, 0, time.UTC)),
+	})
+	if err != nil {
+		t.Fatalf("new provider: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = provider.Close()
+	})
+	return provider
+}
+
+func sequentialClock(base time.Time) func() time.Time {
+	var (
+		mu      sync.Mutex
+		current = base.Add(-time.Second)
+	)
+
+	return func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		current = current.Add(time.Second)
+		return current
+	}
+}
+
+func stringPtr(value string) *string {
+	return &value
+}
+
+func slicePtr(values []string) *[]string {
+	return &values
+}
+
+func labelNames(labels []issuecore.Label) []string {
+	names := make([]string, 0, len(labels))
+	for _, label := range labels {
+		names = append(names, label.Name)
+	}
+	return names
+}
+
+func assigneeLogins(assignees []issuecore.Actor) []string {
+	logins := make([]string, 0, len(assignees))
+	for _, assignee := range assignees {
+		logins = append(logins, assignee.Login)
+	}
+	return logins
+}
+
+func timelineKinds(events []issuecore.TimelineEvent) []string {
+	kinds := make([]string, 0, len(events))
+	for _, event := range events {
+		kinds = append(kinds, event.Kind)
+	}
+	return kinds
+}
+
+func eventKinds(events []EventRecord) []string {
+	kinds := make([]string, 0, len(events))
+	for _, event := range events {
+		kinds = append(kinds, event.Kind)
+	}
+	return kinds
+}
