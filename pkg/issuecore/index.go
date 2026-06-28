@@ -358,7 +358,11 @@ func buildIssueIndexSnapshotFromRecords(records []LogicalRecord, fingerprint, pr
 	}
 
 	for _, issueID := range issueIDs {
-		set, err := ParseIssueRecordSet(groups[issueID])
+		records := groups[issueID]
+		if !hasIssueDocumentRecord(records) {
+			continue
+		}
+		set, err := ParseIssueRecordSet(records)
 		if err != nil {
 			return IssueIndexSnapshot{}, err
 		}
@@ -366,8 +370,8 @@ func buildIssueIndexSnapshotFromRecords(records []LogicalRecord, fingerprint, pr
 		if err != nil {
 			return IssueIndexSnapshot{}, err
 		}
-		paths := make([]LogicalPath, 0, len(groups[issueID]))
-		for _, record := range groups[issueID] {
+		paths := make([]LogicalPath, 0, len(records))
+		for _, record := range records {
 			paths = append(paths, record.Path)
 		}
 		sort.Slice(paths, func(i, j int) bool {
@@ -385,6 +389,16 @@ func buildIssueIndexSnapshotFromRecords(records []LogicalRecord, fingerprint, pr
 		return IssueIndexSnapshot{}, err
 	}
 	return snapshot, nil
+}
+
+func hasIssueDocumentRecord(records []LogicalRecord) bool {
+	for _, record := range records {
+		parsed, err := parseIssueSchemaPath(record.Path)
+		if err == nil && parsed.Kind == issueSchemaPathIssue {
+			return true
+		}
+	}
+	return false
 }
 
 func collectIssueIndexRecords(ctx context.Context, store LogicalStore) ([]LogicalRecord, string, string, error) {

@@ -5,12 +5,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/bagakit/issues/pkg/issuecore"
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -34,8 +37,11 @@ type Provider struct {
 	store      issuecore.LogicalStore
 	now        func() time.Time
 	mu         sync.Mutex
+	rootMu     *sync.Mutex
 	descriptor issuecore.ProviderDescriptor
 }
+
+var rootLocks sync.Map
 
 type eventPayload struct {
 	Title         string   `json:"title,omitempty"`
@@ -53,11 +59,13 @@ func New(cfg Config) (*Provider, error) {
 	if now == nil {
 		now = time.Now
 	}
+	path := strings.TrimSpace(cfg.Path)
 
 	return &Provider{
-		path:  strings.TrimSpace(cfg.Path),
-		store: cfg.Store,
-		now:   now,
+		path:   path,
+		store:  cfg.Store,
+		now:    now,
+		rootMu: rootLock(path),
 		descriptor: issuecore.ProviderDescriptor{
 			Name:  issuecore.ProviderLocal,
 			Kind:  "logical-files",
@@ -90,8 +98,11 @@ func (p *Provider) CreateIssue(ctx context.Context, input issuecore.CreateIssueI
 		return issuecore.Issue{}, p.operationError("create", "invalid_argument", errors.New("issue title is required"))
 	}
 
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	unlock, err := p.lockMutations(ctx)
+	if err != nil {
+		return issuecore.Issue{}, p.operationError("create", "storage_error", err)
+	}
+	defer unlock()
 
 	store, err := p.ensureStore(ctx, "create")
 	if err != nil {
@@ -261,8 +272,11 @@ func (p *Provider) AddComment(ctx context.Context, locator issuecore.IssueLocato
 		return issuecore.Comment{}, p.operationError("comment", "invalid_argument", errors.New("comment body is required"))
 	}
 
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	unlock, err := p.lockMutations(ctx)
+	if err != nil {
+		return issuecore.Comment{}, p.operationError("comment", "storage_error", err)
+	}
+	defer unlock()
 
 	store, err := p.ensureStore(ctx, "comment")
 	if err != nil {
@@ -333,8 +347,11 @@ func (p *Provider) RecordDispatch(ctx context.Context, locator issuecore.IssueLo
 		return issuecore.Issue{}, p.operationError("dispatch", "invalid_argument", err)
 	}
 
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	unlock, err := p.lockMutations(ctx)
+	if err != nil {
+		return issuecore.Issue{}, p.operationError("dispatch", "storage_error", err)
+	}
+	defer unlock()
 
 	store, err := p.ensureStore(ctx, "dispatch")
 	if err != nil {
@@ -360,8 +377,11 @@ func (p *Provider) RecordDispatch(ctx context.Context, locator issuecore.IssueLo
 }
 
 func (p *Provider) changeState(ctx context.Context, operation string, locator issuecore.IssueLocator, state issuecore.IssueState, reason issuecore.IssueStateReason) (issuecore.Issue, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	unlock, err := p.lockMutations(ctx)
+	if err != nil {
+		return issuecore.Issue{}, p.operationError(operation, "storage_error", err)
+	}
+	defer unlock()
 
 	store, err := p.ensureStore(ctx, operation)
 	if err != nil {
@@ -422,6 +442,58 @@ func (p *Provider) ensureStore(ctx context.Context, operation string) (issuecore
 		return nil, p.operationError(operation, "storage_error", err)
 	}
 	return p.store, nil
+}
+
+func (p *Provider) lockMutations(ctx context.Context) (func(), error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	mu := &p.mu
+	if p.rootMu != nil {
+		mu = p.rootMu
+	}
+	mu.Lock()
+
+	var lockFile *os.File
+	if p.path != "" {
+		if err := os.MkdirAll(p.path, 0o755); err != nil {
+			mu.Unlock()
+			return nil, err
+		}
+		file, err := os.OpenFile(filepath.Join(p.path, ".issues.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+		if err != nil {
+			mu.Unlock()
+			return nil, err
+		}
+		if err := unix.Flock(int(file.Fd()), unix.LOCK_EX); err != nil {
+			_ = file.Close()
+			mu.Unlock()
+			return nil, err
+		}
+		lockFile = file
+	}
+
+	return func() {
+		if lockFile != nil {
+			_ = unix.Flock(int(lockFile.Fd()), unix.LOCK_UN)
+			_ = lockFile.Close()
+		}
+		mu.Unlock()
+	}, nil
+}
+
+func rootLock(path string) *sync.Mutex {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return nil
+	}
+	key, err := filepath.Abs(path)
+	if err != nil {
+		key = filepath.Clean(path)
+	}
+	value, _ := rootLocks.LoadOrStore(key, &sync.Mutex{})
+	return value.(*sync.Mutex)
 }
 
 func ensureManifest(ctx context.Context, store issuecore.LogicalStore) error {
@@ -581,12 +653,37 @@ func writeRecordSet(ctx context.Context, store issuecore.LogicalStore, set issue
 	if err != nil {
 		return err
 	}
-	for _, record := range records {
-		if _, err := store.Write(ctx, record, "", createOnly); err != nil {
+	for _, record := range commitOrderedRecords(records) {
+		expect := issuecore.RecordVersion("")
+		writeCreateOnly := createOnly
+		if !createOnly {
+			current, err := store.Read(ctx, record.Path)
+			switch {
+			case err == nil:
+				expect = current.Version
+			case errors.Is(err, issuecore.ErrLogicalRecordNotFound):
+				writeCreateOnly = true
+			default:
+				return err
+			}
+		}
+		if _, err := store.Write(ctx, record, expect, writeCreateOnly); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func commitOrderedRecords(records []issuecore.LogicalRecord) []issuecore.LogicalRecord {
+	ordered := append([]issuecore.LogicalRecord(nil), records...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		return !isIssueDocumentRecord(ordered[i]) && isIssueDocumentRecord(ordered[j])
+	})
+	return ordered
+}
+
+func isIssueDocumentRecord(record issuecore.LogicalRecord) bool {
+	return strings.HasSuffix(record.Path.String(), "/issue.md")
 }
 
 func listByNumberCursor(index *issuecore.IssueIndex, query issuecore.ListIssuesQuery) (issuecore.IssuePage, error) {

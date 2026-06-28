@@ -202,6 +202,41 @@ func TestIssueIndexRejectsConflictingProviderLocatorFields(t *testing.T) {
 	}
 }
 
+func TestIssueIndexSkipsIncompleteIssueWithoutDocument(t *testing.T) {
+	t.Parallel()
+
+	store := newIndexFixtureStore(t)
+	issue := indexFixtureIssue(t, 7, IssueStateOpen, "bagakit/issues", "partial", "body", nil, nil, time.Hour)
+	set, err := NewIssueRecordSet(issue)
+	if err != nil {
+		t.Fatalf("new issue record set: %v", err)
+	}
+	records, err := set.ToLogicalRecords()
+	if err != nil {
+		t.Fatalf("logical records: %v", err)
+	}
+	issuePath, err := IssueDocumentPath(IssueID(issue.ID))
+	if err != nil {
+		t.Fatalf("issue document path: %v", err)
+	}
+	partial := make([]LogicalRecord, 0, len(records)-1)
+	for _, record := range records {
+		if record.Path == issuePath {
+			continue
+		}
+		partial = append(partial, record)
+	}
+	writeLogicalRecords(t, store, partial)
+
+	index, err := BuildIssueIndex(context.Background(), store)
+	if err != nil {
+		t.Fatalf("incomplete issue records should not break index rebuild: %v", err)
+	}
+	if got := indexIssueCount(t, index); got != 0 {
+		t.Fatalf("incomplete issue records should not be index-visible, got %d entries", got)
+	}
+}
+
 func TestIssueIndexManagerRebuildsMissingStaleAndCorruptCache(t *testing.T) {
 	t.Parallel()
 

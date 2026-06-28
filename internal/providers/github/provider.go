@@ -316,7 +316,7 @@ func (p *Provider) PlanCreateIssue(input issuecore.CreateIssueInput) (RequestPla
 	if milestone := strings.TrimSpace(input.Milestone); milestone != "" {
 		value, err := parseMilestoneNumber(milestone)
 		if err != nil {
-			return RequestPlan{}, p.unsupportedMilestone("create")
+			return RequestPlan{}, p.milestoneInputError("create", milestone, err)
 		}
 		payload["milestone"] = value
 	}
@@ -367,7 +367,7 @@ func (p *Provider) PlanUpdateIssue(locator issuecore.IssueLocator, patch issueco
 		} else {
 			value, err := parseMilestoneNumber(milestone)
 			if err != nil {
-				return RequestPlan{}, p.unsupportedMilestone("update")
+				return RequestPlan{}, p.milestoneInputError("update", milestone, err)
 			}
 			payload["milestone"] = value
 		}
@@ -835,6 +835,13 @@ func (p *Provider) unsupportedMilestone(operation string) error {
 		Reason:               "this provider can pass numeric GitHub milestone ids but does not resolve milestone titles",
 		SuggestedAlternative: "pass the numeric milestone id, or omit --milestone until title lookup is implemented",
 	})
+}
+
+func (p *Provider) milestoneInputError(operation, raw string, err error) error {
+	if _, atoiErr := strconv.Atoi(strings.TrimSpace(raw)); atoiErr == nil {
+		return p.operationError(operation, "invalid_argument", err)
+	}
+	return p.unsupportedMilestone(operation)
 }
 
 func buildPlan(operation, method string, u *url.URL, payload any) (RequestPlan, error) {

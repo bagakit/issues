@@ -573,6 +573,61 @@ func TestPlanMutationsReportUnsupportedMilestoneTitleLookup(t *testing.T) {
 	}
 }
 
+func TestPlanMutationsReportInvalidNumericMilestoneInput(t *testing.T) {
+	t.Parallel()
+
+	provider := newTestProvider(t, "test-token", nil)
+	tests := []struct {
+		name      string
+		operation string
+		plan      func() (RequestPlan, error)
+	}{
+		{
+			name:      "create zero",
+			operation: "create",
+			plan: func() (RequestPlan, error) {
+				return provider.PlanCreateIssue(issuecore.CreateIssueInput{
+					Repository: "bagakit/issues",
+					Title:      "ship it",
+					Milestone:  "0",
+				})
+			},
+		},
+		{
+			name:      "update negative",
+			operation: "update",
+			plan: func() (RequestPlan, error) {
+				return provider.PlanUpdateIssue(issuecore.IssueLocator{Repository: "bagakit/issues", Number: 9}, issuecore.IssuePatch{
+					Milestone: stringPtr("-1"),
+				})
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := tt.plan()
+			if err == nil {
+				t.Fatalf("expected invalid numeric milestone error")
+			}
+			var opErr *issuecore.OperationError
+			if !errors.As(err, &opErr) {
+				t.Fatalf("expected OperationError, got %T", err)
+			}
+			if opErr.Code != "invalid_argument" || opErr.Operation != tt.operation {
+				t.Fatalf("unexpected operation error: %+v", opErr)
+			}
+			var unsupported *issuecore.UnsupportedCapabilityError
+			if errors.As(err, &unsupported) {
+				t.Fatalf("numeric milestone input should not be classified as unsupported capability: %+v", unsupported.Capability)
+			}
+		})
+	}
+}
+
 func TestPlanGetIssueReportsUnsupportedNodeIDLookup(t *testing.T) {
 	t.Parallel()
 

@@ -33,6 +33,7 @@ type serviceConfig struct {
 	LocalStorePath string
 	GitHubToken    string
 	GitHubBaseURL  string
+	GitHubRequired bool
 }
 
 type App struct {
@@ -57,6 +58,16 @@ func New(version string) (*App, error) {
 				BaseURL: cfg.GitHubBaseURL,
 			})
 			if err != nil {
+				if !cfg.GitHubRequired {
+					service, err := issuecore.NewService(localProvider)
+					if err != nil {
+						_ = localProvider.Close()
+						return nil, nil, err
+					}
+					return service, func() {
+						_ = localProvider.Close()
+					}, nil
+				}
 				_ = localProvider.Close()
 				return nil, nil, err
 			}
@@ -86,7 +97,18 @@ func (a *App) Run(ctx context.Context, args []string) int {
 		return 2
 	}
 
-	service, cleanup, err := a.resolveService(global)
+	if len(args) == 0 {
+		a.writeUsage(a.Stderr)
+		return 2
+	}
+
+	switch args[0] {
+	case "help", "-h", "--help":
+		a.writeUsage(a.Stdout)
+		return 0
+	}
+
+	service, cleanup, err := a.resolveService(global, args)
 	if err != nil {
 		fmt.Fprintf(a.Stderr, "issues: %v\n", err)
 		return 1
@@ -99,15 +121,7 @@ func (a *App) Run(ctx context.Context, args []string) int {
 		a.Service = previousService
 	}()
 
-	if len(args) == 0 {
-		a.writeUsage(a.Stderr)
-		return 2
-	}
-
 	switch args[0] {
-	case "help", "-h", "--help":
-		a.writeUsage(a.Stdout)
-		return 0
 	case "version":
 		return a.runVersion(args[1:])
 	case "providers":
@@ -1003,7 +1017,7 @@ func visitedFlags(flags *flag.FlagSet) map[string]bool {
 	return visited
 }
 
-func (a *App) resolveService(options globalOptions) (*issuecore.Service, func(), error) {
+func (a *App) resolveService(options globalOptions, args []string) (*issuecore.Service, func(), error) {
 	if a.Service != nil {
 		return a.Service, func() {}, nil
 	}
@@ -1014,5 +1028,27 @@ func (a *App) resolveService(options globalOptions) (*issuecore.Service, func(),
 		LocalStorePath: options.LocalStorePath,
 		GitHubToken:    options.GitHubToken,
 		GitHubBaseURL:  options.GitHubBaseURL,
+		GitHubRequired: commandRequestsGitHub(args),
 	})
+}
+
+func commandRequestsGitHub(args []string) bool {
+	if len(args) == 0 {
+		return false
+	}
+	switch args[0] {
+	case "list", "view", "create", "edit", "update", "context", "record-dispatch", "comment", "close", "reopen":
+	default:
+		return false
+	}
+	for idx := 1; idx < len(args); idx++ {
+		arg := args[idx]
+		switch {
+		case arg == "--provider" && idx+1 < len(args):
+			return args[idx+1] == issuecore.ProviderGitHub
+		case strings.HasPrefix(arg, "--provider="):
+			return strings.TrimPrefix(arg, "--provider=") == issuecore.ProviderGitHub
+		}
+	}
+	return false
 }

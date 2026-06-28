@@ -2,6 +2,8 @@ package localfile
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -131,6 +133,116 @@ func TestProviderCRUDUsesCanonicalLogicalFiles(t *testing.T) {
 	}
 	if len(page.Issues) != 1 || page.Issues[0].ID != created.ID || page.Issues[0].Comments != 1 {
 		t.Fatalf("unexpected rebuilt page: %+v", page.Issues)
+	}
+}
+
+func TestProviderSerializesConcurrentCreatesAcrossInstances(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	ctx := context.Background()
+	const total = 16
+
+	start := make(chan struct{})
+	numbers := make(chan int, total)
+	errs := make(chan error, total)
+	var wg sync.WaitGroup
+	for idx := 0; idx < total; idx++ {
+		idx := idx
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			provider, err := New(Config{Path: root})
+			if err != nil {
+				errs <- err
+				return
+			}
+			<-start
+			created, err := provider.CreateIssue(ctx, issuecore.CreateIssueInput{
+				Repository: "bagakit/issues",
+				Title:      fmt.Sprintf("concurrent %02d", idx),
+			})
+			if err != nil {
+				errs <- err
+				return
+			}
+			numbers <- created.Number
+		}()
+	}
+
+	close(start)
+	wg.Wait()
+	close(errs)
+	close(numbers)
+
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent create failed: %v", err)
+		}
+	}
+
+	seen := map[int]bool{}
+	for number := range numbers {
+		if seen[number] {
+			t.Fatalf("duplicate issue number %d", number)
+		}
+		seen[number] = true
+	}
+	for number := 1; number <= total; number++ {
+		if !seen[number] {
+			t.Fatalf("missing issue number %d from %#v", number, seen)
+		}
+	}
+
+	store, err := issuecore.NewFileSystemStore(root)
+	if err != nil {
+		t.Fatalf("new filesystem store: %v", err)
+	}
+	index, err := issuecore.BuildIssueIndex(ctx, store)
+	if err != nil {
+		t.Fatalf("build index: %v", err)
+	}
+	page, err := index.List(issuecore.ListIssuesQuery{State: issuecore.IssueStateFilterAll, Limit: total})
+	if err != nil {
+		t.Fatalf("list index: %v", err)
+	}
+	if len(page.Issues) != total {
+		t.Fatalf("expected %d issues, got %d", total, len(page.Issues))
+	}
+}
+
+func TestProviderCreateFailureLeavesNoIndexVisiblePartialIssue(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	base, err := issuecore.NewFileSystemStore(root)
+	if err != nil {
+		t.Fatalf("new filesystem store: %v", err)
+	}
+	store := &failIssueDocumentWriteStore{LogicalStore: base}
+	provider, err := New(Config{Store: store})
+	if err != nil {
+		t.Fatalf("new provider: %v", err)
+	}
+
+	_, err = provider.CreateIssue(context.Background(), issuecore.CreateIssueInput{
+		Repository: "bagakit/issues",
+		Title:      "partial create",
+	})
+	if err == nil {
+		t.Fatalf("expected create failure")
+	}
+
+	index, err := issuecore.BuildIssueIndex(context.Background(), base)
+	if err != nil {
+		t.Fatalf("partial failed create should not break index rebuild: %v", err)
+	}
+	page, err := index.List(issuecore.ListIssuesQuery{State: issuecore.IssueStateFilterAll})
+	if err != nil {
+		t.Fatalf("list index: %v", err)
+	}
+	if len(page.Issues) != 0 {
+		t.Fatalf("failed create should not be index-visible: %+v", page.Issues)
 	}
 }
 
@@ -313,6 +425,19 @@ func newTestProvider(t *testing.T, root string) *Provider {
 		t.Fatalf("new provider: %v", err)
 	}
 	return provider
+}
+
+type failIssueDocumentWriteStore struct {
+	issuecore.LogicalStore
+	failed bool
+}
+
+func (store *failIssueDocumentWriteStore) Write(ctx context.Context, record issuecore.LogicalRecord, expect issuecore.RecordVersion, createOnly bool) (issuecore.LogicalRecord, error) {
+	if isIssueDocumentRecord(record) && !store.failed {
+		store.failed = true
+		return issuecore.LogicalRecord{}, errors.New("injected issue document write failure")
+	}
+	return store.LogicalStore.Write(ctx, record, expect, createOnly)
 }
 
 func sequentialClock(base time.Time) func() time.Time {

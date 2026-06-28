@@ -186,6 +186,65 @@ func TestParseGlobalArgsGitHubFlagsOverrideEnv(t *testing.T) {
 	}
 }
 
+func TestRunInvalidOptionalGitHubBaseURLDoesNotBlockLocalFlows(t *testing.T) {
+	t.Setenv(githubAPIBaseURLEnv, "not-a-url")
+
+	app, err := New("test-build")
+	if err != nil {
+		t.Fatalf("new app: %v", err)
+	}
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	app.Stdout = &stdout
+	app.Stderr = &stderr
+	reset := func() {
+		stdout.Reset()
+		stderr.Reset()
+	}
+
+	code := app.Run(context.Background(), []string{"help"})
+	if code != 0 {
+		t.Fatalf("help should not resolve providers, got exit=%d stderr=%q", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "Commands:") {
+		t.Fatalf("help output missing commands: %q", stdout.String())
+	}
+
+	reset()
+	code = app.Run(context.Background(), []string{"version", "--json"})
+	if code != 0 {
+		t.Fatalf("version should ignore optional GitHub provider config, got exit=%d stderr=%q", code, stderr.String())
+	}
+	var versionPayload struct {
+		Providers []struct {
+			Name string `json:"name"`
+		} `json:"providers"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &versionPayload); err != nil {
+		t.Fatalf("decode version output: %v", err)
+	}
+	if len(versionPayload.Providers) != 1 || versionPayload.Providers[0].Name != issuecore.ProviderLocal {
+		t.Fatalf("expected local-only provider set, got %+v", versionPayload.Providers)
+	}
+
+	reset()
+	localRoot := filepath.Join(t.TempDir(), "issues-root")
+	code = app.Run(context.Background(), []string{"--local-root", localRoot, "create", "--title", "local only", "--json"})
+	if code != 0 {
+		t.Fatalf("local create should ignore optional GitHub provider config, got exit=%d stderr=%q stdout=%q", code, stderr.String(), stdout.String())
+	}
+
+	reset()
+	code = app.Run(context.Background(), []string{"list", "--provider", "github", "--repository", "bagakit/issues", "--json"})
+	if code != 1 {
+		t.Fatalf("explicit GitHub command should fail provider configuration, got exit=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "GitHub API base URL") {
+		t.Fatalf("expected GitHub base URL error, got stderr=%q stdout=%q", stderr.String(), stdout.String())
+	}
+}
+
 func TestParseGlobalArgsLocalRootOverridesCompatibilityEnv(t *testing.T) {
 	t.Setenv(localStoreEnv, "/tmp/issues-root")
 	t.Setenv(localStoreCompatEnv, "/tmp/issues-store")
