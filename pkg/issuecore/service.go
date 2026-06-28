@@ -220,7 +220,7 @@ func (s *Service) SubmitDispatch(ctx context.Context, provider string, request D
 
 	if recorder, ok := backend.(DispatchRecorder); ok {
 		if _, err := recorder.RecordDispatch(ctx, request.Issue, result.Record); err != nil {
-			return DispatchResult{}, err
+			return result, PostDeliveryPersistence(provider, "dispatch", result, err)
 		}
 	}
 
@@ -254,18 +254,7 @@ func normalizeIssue(issue Issue, provider string) Issue {
 }
 
 func normalizeDispatchRequest(issue Issue, request DispatchRequest) DispatchRequest {
-	if request.Issue.Provider == "" {
-		request.Issue.Provider = issue.Provider
-	}
-	if request.Issue.Repository == "" {
-		request.Issue.Repository = issue.Repository
-	}
-	if request.Issue.ID == "" {
-		request.Issue.ID = issue.ID
-	}
-	if request.Issue.Number == 0 {
-		request.Issue.Number = issue.Number
-	}
+	request.Issue = dispatchIssueLocator(issue)
 	request.IssueContext = mergeIssueContextLink(NewIssueContextLink(issue, ContextFormatJSON), request.IssueContext)
 	return request
 }
@@ -287,22 +276,16 @@ func mergeIssueContextLink(base, override IssueContextLink) IssueContextLink {
 	if override.Format != "" {
 		base.Format = override.Format
 	}
-	if strings.TrimSpace(override.Provider) != "" {
-		base.Provider = override.Provider
-	}
-	if strings.TrimSpace(override.Repository) != "" {
-		base.Repository = override.Repository
-	}
-	if strings.TrimSpace(override.IssueID) != "" {
-		base.IssueID = override.IssueID
-	}
-	if override.IssueNumber > 0 {
-		base.IssueNumber = override.IssueNumber
-	}
-	if strings.TrimSpace(override.HTMLURL) != "" {
-		base.HTMLURL = override.HTMLURL
-	}
 	return base
+}
+
+func dispatchIssueLocator(issue Issue) IssueLocator {
+	return IssueLocator{
+		Provider:   strings.TrimSpace(issue.Provider),
+		Repository: strings.TrimSpace(issue.Repository),
+		ID:         strings.TrimSpace(issue.ID),
+		Number:     issue.Number,
+	}
 }
 
 func mergeDispatchTargetGroup(base, override DispatchTargetGroup) DispatchTargetGroup {

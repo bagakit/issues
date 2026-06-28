@@ -13,6 +13,7 @@ var (
 	ErrInvalidInput              = errors.New("invalid input")
 	ErrResourceNotFound          = errors.New("resource not found")
 	ErrNotImplemented            = errors.New("operation not implemented")
+	ErrPostDeliveryPersistence   = errors.New("post-delivery persistence error")
 )
 
 type OperationError struct {
@@ -108,5 +109,36 @@ func ResourceNotFound(provider, operation string, err error) error {
 		Provider:  provider,
 		Operation: operation,
 		Err:       errors.Join(ErrResourceNotFound, err),
+	}
+}
+
+type PostDeliveryPersistenceError struct {
+	Provider  string
+	Operation string
+	Result    DispatchResult
+	Err       error
+}
+
+func (e *PostDeliveryPersistenceError) Error() string {
+	if e.Provider == "" {
+		return fmt.Sprintf("%s delivered but failed to persist post-delivery state: %v", e.Operation, e.Err)
+	}
+	return fmt.Sprintf("provider %q %s delivered but failed to persist post-delivery state: %v", e.Provider, e.Operation, e.Err)
+}
+
+func (e *PostDeliveryPersistenceError) Unwrap() error {
+	return e.Err
+}
+
+func (e *PostDeliveryPersistenceError) Is(target error) bool {
+	return target == ErrPostDeliveryPersistence
+}
+
+func PostDeliveryPersistence(provider, operation string, result DispatchResult, err error) error {
+	return &PostDeliveryPersistenceError{
+		Provider:  provider,
+		Operation: operation,
+		Result:    result,
+		Err:       err,
 	}
 }

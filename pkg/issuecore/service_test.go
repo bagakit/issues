@@ -16,6 +16,7 @@ type fakeProvider struct {
 	getIssue         Issue
 	recordLocator    IssueLocator
 	recordDispatches []DispatchRecord
+	recordErr        error
 }
 
 func (p *fakeProvider) Descriptor() ProviderDescriptor {
@@ -31,7 +32,8 @@ func (p *fakeProvider) ListIssues(_ context.Context, query ListIssuesQuery) (Iss
 	return p.listPage, nil
 }
 
-func (p *fakeProvider) GetIssue(context.Context, IssueLocator) (Issue, error) {
+func (p *fakeProvider) GetIssue(_ context.Context, locator IssueLocator) (Issue, error) {
+	p.getLocator = locator
 	return p.getIssue, nil
 }
 
@@ -53,6 +55,9 @@ func (p *fakeProvider) ReopenIssue(context.Context, IssueLocator, ReopenIssueInp
 
 func (p *fakeProvider) RecordDispatch(_ context.Context, locator IssueLocator, record DispatchRecord) (Issue, error) {
 	p.recordLocator = locator
+	if p.recordErr != nil {
+		return Issue{}, p.recordErr
+	}
 	p.recordDispatches = append(p.recordDispatches, record)
 
 	issue := p.getIssue
@@ -273,13 +278,27 @@ func TestServiceSubmitDispatchNormalizesAndPersistsRecord(t *testing.T) {
 	}
 
 	request := DispatchRequest{
-		Issue:       IssueLocator{Number: 7},
+		Issue: IssueLocator{
+			Provider:   "spoofed",
+			Repository: "spoofed/repo",
+			ID:         "spoofed-id",
+			Number:     7,
+		},
 		TargetGroup: DispatchTargetGroup{ID: "grp-1", Name: "Spec"},
 		Terminal: DispatchTerminal{
 			Mode: DispatchTerminalModeCreateNew,
 			New: &NewTerminal{
 				Title: "Spec Terminal",
 			},
+		},
+		IssueContext: IssueContextLink{
+			SchemaVersion: "spoofed.context.v1",
+			Format:        ContextFormatPrompt,
+			Provider:      "spoofed",
+			Repository:    "spoofed/repo",
+			IssueID:       "spoofed-id",
+			IssueNumber:   77,
+			HTMLURL:       "https://spoofed.invalid/issues/77",
 		},
 	}
 
@@ -296,10 +315,27 @@ func TestServiceSubmitDispatchNormalizesAndPersistsRecord(t *testing.T) {
 	if gateway.dispatchRequest.Issue.Provider != ProviderLocal {
 		t.Fatalf("request locator provider should be normalized, got %+v", gateway.dispatchRequest.Issue)
 	}
+	if gateway.dispatchRequest.Issue.Repository != "bagakit/issues" ||
+		gateway.dispatchRequest.Issue.ID != "local-issue-000007" ||
+		gateway.dispatchRequest.Issue.Number != 7 {
+		t.Fatalf("request locator should use fetched issue identity, got %+v", gateway.dispatchRequest.Issue)
+	}
 	if gateway.dispatchRequest.IssueContext.Provider != ProviderLocal ||
 		gateway.dispatchRequest.IssueContext.Repository != "bagakit/issues" ||
-		gateway.dispatchRequest.IssueContext.IssueNumber != 7 {
+		gateway.dispatchRequest.IssueContext.IssueID != "local-issue-000007" ||
+		gateway.dispatchRequest.IssueContext.IssueNumber != 7 ||
+		gateway.dispatchRequest.IssueContext.HTMLURL != "https://example.invalid/issues/7" {
 		t.Fatalf("request issue context should be normalized, got %+v", gateway.dispatchRequest.IssueContext)
+	}
+	if gateway.dispatchRequest.IssueContext.SchemaVersion != "spoofed.context.v1" ||
+		gateway.dispatchRequest.IssueContext.Format != ContextFormatPrompt {
+		t.Fatalf("request issue context should preserve schema/format overrides, got %+v", gateway.dispatchRequest.IssueContext)
+	}
+	if provider.recordLocator.Provider != ProviderLocal ||
+		provider.recordLocator.Repository != "bagakit/issues" ||
+		provider.recordLocator.ID != "local-issue-000007" ||
+		provider.recordLocator.Number != 7 {
+		t.Fatalf("persisted locator should use fetched issue identity, got %+v", provider.recordLocator)
 	}
 	if len(provider.recordDispatches) != 1 {
 		t.Fatalf("expected one persisted dispatch record, got %d", len(provider.recordDispatches))
@@ -309,6 +345,16 @@ func TestServiceSubmitDispatchNormalizesAndPersistsRecord(t *testing.T) {
 	}
 	if provider.recordDispatches[0].IssueContext.Provider != ProviderLocal {
 		t.Fatalf("persisted issue context missing provider: %+v", provider.recordDispatches[0].IssueContext)
+	}
+	if provider.recordDispatches[0].IssueContext.Repository != "bagakit/issues" ||
+		provider.recordDispatches[0].IssueContext.IssueID != "local-issue-000007" ||
+		provider.recordDispatches[0].IssueContext.IssueNumber != 7 ||
+		provider.recordDispatches[0].IssueContext.HTMLURL != "https://example.invalid/issues/7" {
+		t.Fatalf("persisted issue context should use fetched issue identity, got %+v", provider.recordDispatches[0].IssueContext)
+	}
+	if provider.recordDispatches[0].IssueContext.SchemaVersion != "spoofed.context.v1" ||
+		provider.recordDispatches[0].IssueContext.Format != ContextFormatPrompt {
+		t.Fatalf("persisted issue context should preserve schema/format overrides, got %+v", provider.recordDispatches[0].IssueContext)
 	}
 }
 
@@ -365,5 +411,87 @@ func TestServiceSubmitDispatchDoesNotRequireRecorder(t *testing.T) {
 	}
 	if gateway.dispatchRequest.IssueContext.Provider != ProviderGitHub {
 		t.Fatalf("request issue context should be normalized, got %+v", gateway.dispatchRequest.IssueContext)
+	}
+}
+
+func TestServiceSubmitDispatchReturnsDeliveredResultWhenPersistenceFails(t *testing.T) {
+	t.Parallel()
+
+	dispatchedAt := time.Date(2024, time.January, 2, 12, 45, 0, 0, time.UTC)
+	recordErr := &OperationError{
+		Code:      "storage_error",
+		Provider:  ProviderLocal,
+		Operation: "dispatch",
+		Err:       errors.New("disk full"),
+	}
+	provider := &fakeProvider{
+		descriptor: ProviderDescriptor{Name: ProviderLocal},
+		getIssue: Issue{
+			Repository: "bagakit/issues",
+			ID:         "local-issue-000011",
+			Number:     11,
+			HTMLURL:    "https://example.invalid/issues/11",
+			Title:      "dispatch me",
+			State:      IssueStateOpen,
+		},
+		recordErr: recordErr,
+	}
+	gateway := &fakeDispatchGateway{
+		dispatchResult: DispatchResult{
+			Record: DispatchRecord{
+				ID:           "dispatch-11",
+				DispatchedAt: dispatchedAt,
+				Outcome:      DispatchOutcomeDelivered,
+			},
+		},
+	}
+
+	service, err := NewServiceWithDispatch(gateway, provider)
+	if err != nil {
+		t.Fatalf("new service: %v", err)
+	}
+
+	result, err := service.SubmitDispatch(context.Background(), ProviderLocal, DispatchRequest{
+		Issue:       IssueLocator{Number: 11},
+		TargetGroup: DispatchTargetGroup{ID: "grp-11", Name: "Spec"},
+		Terminal: DispatchTerminal{
+			Mode: DispatchTerminalModeCreateNew,
+			New:  &NewTerminal{Title: "Spec Terminal"},
+		},
+	})
+	if err == nil {
+		t.Fatalf("expected post-delivery persistence error")
+	}
+	if err := result.Record.Validate(); err != nil {
+		t.Fatalf("dispatch result should still validate: %v", err)
+	}
+	if result.Record.Outcome != DispatchOutcomeDelivered {
+		t.Fatalf("delivered result should be preserved, got %+v", result.Record)
+	}
+
+	var persistErr *PostDeliveryPersistenceError
+	if !errors.As(err, &persistErr) {
+		t.Fatalf("expected PostDeliveryPersistenceError, got %T", err)
+	}
+	if !errors.Is(err, ErrPostDeliveryPersistence) {
+		t.Fatalf("expected ErrPostDeliveryPersistence, got %v", err)
+	}
+	if !errors.Is(err, recordErr) {
+		t.Fatalf("expected wrapped record error, got %v", err)
+	}
+	if persistErr.Provider != ProviderLocal || persistErr.Operation != "dispatch" {
+		t.Fatalf("unexpected persistence error metadata: %+v", persistErr)
+	}
+	if persistErr.Result.Record.ID != "dispatch-11" {
+		t.Fatalf("persistence error should preserve result, got %+v", persistErr.Result)
+	}
+	if len(provider.recordDispatches) != 0 {
+		t.Fatalf("record dispatches should not be appended on failure, got %+v", provider.recordDispatches)
+	}
+	if provider.recordLocator.Provider != ProviderLocal ||
+		provider.recordLocator.Repository != "bagakit/issues" ||
+		provider.recordLocator.ID != "local-issue-000011" ||
+		provider.recordLocator.Number != 11 {
+		t.Fatalf("record locator should still be canonical on failure, got %+v", provider.recordLocator)
 	}
 }

@@ -395,6 +395,110 @@ func TestProviderStateReasonValidationRejectsInvalidUpdateCloseAndReopenReasons(
 	assertLocalInvalidArgument(t, err, "reopen", "unsupported reopen reason")
 }
 
+func TestProviderChangeStateNoOpPreservesIssueMetadataAndTimeline(t *testing.T) {
+	t.Parallel()
+
+	provider := newTestProvider(t)
+	ctx := context.Background()
+
+	created, err := provider.CreateIssue(ctx, issuecore.CreateIssueInput{
+		Repository: "bagakit/issues",
+		Title:      "state noop",
+		Body:       "do not rewrite",
+	})
+	if err != nil {
+		t.Fatalf("create issue: %v", err)
+	}
+
+	reopened, err := provider.ReopenIssue(ctx, issuecore.IssueLocator{Number: created.Number, Repository: created.Repository}, issuecore.ReopenIssueInput{})
+	if err != nil {
+		t.Fatalf("reopen already-open issue: %v", err)
+	}
+	if reopened.State != issuecore.IssueStateOpen || reopened.StateReason != created.StateReason {
+		t.Fatalf("unexpected reopened issue: %+v", reopened)
+	}
+	if !reopened.UpdatedAt.Equal(created.UpdatedAt) {
+		t.Fatalf("updated_at changed on reopen no-op: before=%s after=%s", created.UpdatedAt, reopened.UpdatedAt)
+	}
+	if reopened.ClosedAt != nil {
+		t.Fatalf("closed_at should stay nil on reopen no-op: %+v", reopened.ClosedAt)
+	}
+	if got := timelineKinds(reopened.Timeline); !reflect.DeepEqual(got, []string{"created"}) {
+		t.Fatalf("unexpected timeline after reopen no-op: %#v", got)
+	}
+
+	closed, err := provider.CloseIssue(ctx, issuecore.IssueLocator{Number: created.Number, Repository: created.Repository}, issuecore.CloseIssueInput{
+		Reason: issuecore.IssueStateReasonNotPlanned,
+	})
+	if err != nil {
+		t.Fatalf("close issue: %v", err)
+	}
+	if closed.ClosedAt == nil {
+		t.Fatalf("closed issue missing closed_at: %+v", closed)
+	}
+
+	closedAgain, err := provider.CloseIssue(ctx, issuecore.IssueLocator{Number: created.Number, Repository: created.Repository}, issuecore.CloseIssueInput{
+		Reason: issuecore.IssueStateReasonCompleted,
+	})
+	if err != nil {
+		t.Fatalf("close already-closed issue: %v", err)
+	}
+	if closedAgain.State != issuecore.IssueStateClosed || closedAgain.StateReason != closed.StateReason {
+		t.Fatalf("unexpected closed-again issue: %+v", closedAgain)
+	}
+	if !closedAgain.UpdatedAt.Equal(closed.UpdatedAt) {
+		t.Fatalf("updated_at changed on close no-op: before=%s after=%s", closed.UpdatedAt, closedAgain.UpdatedAt)
+	}
+	if closedAgain.ClosedAt == nil || !closedAgain.ClosedAt.Equal(*closed.ClosedAt) {
+		t.Fatalf("closed_at changed on close no-op: before=%v after=%v", closed.ClosedAt, closedAgain.ClosedAt)
+	}
+	if got := timelineKinds(closedAgain.Timeline); !reflect.DeepEqual(got, []string{"created", "closed"}) {
+		t.Fatalf("unexpected timeline after close no-op: %#v", got)
+	}
+}
+
+func TestProviderListReportsListOperationForLoadFailures(t *testing.T) {
+	t.Parallel()
+
+	provider := newTestProvider(t)
+	ctx := context.Background()
+
+	created, err := provider.CreateIssue(ctx, issuecore.CreateIssueInput{
+		Repository: "bagakit/issues",
+		Title:      "list failure",
+	})
+	if err != nil {
+		t.Fatalf("create issue: %v", err)
+	}
+
+	db, err := provider.ensureDB(ctx, "test", provider.path, provider.now)
+	if err != nil {
+		t.Fatalf("ensure db: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE issues SET created_at = ? WHERE issue_id = ?`, "not-a-timestamp", created.ID); err != nil {
+		t.Fatalf("corrupt issue row: %v", err)
+	}
+
+	_, err = provider.ListIssues(ctx, issuecore.ListIssuesQuery{
+		Repository: created.Repository,
+		State:      issuecore.IssueStateFilterAll,
+	})
+	if err == nil {
+		t.Fatalf("expected list failure")
+	}
+
+	var opErr *issuecore.OperationError
+	if !errors.As(err, &opErr) {
+		t.Fatalf("expected OperationError, got %T", err)
+	}
+	if opErr.Code != "storage_error" {
+		t.Fatalf("unexpected error code: %q", opErr.Code)
+	}
+	if opErr.Operation != "list" {
+		t.Fatalf("unexpected operation: %q", opErr.Operation)
+	}
+}
+
 func newTestProvider(t *testing.T) *Provider {
 	t.Helper()
 

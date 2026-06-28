@@ -177,7 +177,7 @@ func (p *Provider) CreateIssue(ctx context.Context, input issuecore.CreateIssueI
 		return issuecore.Issue{}, p.operationError("create", "storage_error", err)
 	}
 
-	issue, err := p.loadIssueByID(ctx, tx, issueID, true)
+	issue, err := p.loadIssueByID(ctx, tx, "create", issueID, true)
 	if err != nil {
 		return issuecore.Issue{}, err
 	}
@@ -207,7 +207,7 @@ func (p *Provider) GetIssue(ctx context.Context, locator issuecore.IssueLocator)
 	if err != nil {
 		return issuecore.Issue{}, err
 	}
-	return p.loadIssueByID(ctx, db, key.IssueID, true)
+	return p.loadIssueByID(ctx, db, "get", key.IssueID, true)
 }
 
 func (p *Provider) UpdateIssue(ctx context.Context, locator issuecore.IssueLocator, patch issuecore.IssuePatch) (issuecore.Issue, error) {
@@ -305,7 +305,7 @@ func (p *Provider) UpdateIssue(ctx context.Context, locator issuecore.IssueLocat
 		return issuecore.Issue{}, p.operationError("update", "storage_error", err)
 	}
 
-	issue, err := p.loadIssueByID(ctx, tx, key.IssueID, true)
+	issue, err := p.loadIssueByID(ctx, tx, "update", key.IssueID, true)
 	if err != nil {
 		return issuecore.Issue{}, err
 	}
@@ -434,7 +434,7 @@ func (p *Provider) RecordDispatch(ctx context.Context, locator issuecore.IssueLo
 		return issuecore.Issue{}, err
 	}
 
-	issue, err := p.loadIssueByID(ctx, tx, key.IssueID, false)
+	issue, err := p.loadIssueByID(ctx, tx, "dispatch", key.IssueID, false)
 	if err != nil {
 		return issuecore.Issue{}, err
 	}
@@ -468,7 +468,7 @@ func (p *Provider) RecordDispatch(ctx context.Context, locator issuecore.IssueLo
 		return issuecore.Issue{}, p.operationError("dispatch", "storage_error", err)
 	}
 
-	issue, err = p.loadIssueByID(ctx, tx, key.IssueID, true)
+	issue, err = p.loadIssueByID(ctx, tx, "dispatch", key.IssueID, true)
 	if err != nil {
 		return issuecore.Issue{}, err
 	}
@@ -498,7 +498,7 @@ func (p *Provider) Export(ctx context.Context) (Snapshot, error) {
 		return Snapshot{}, err
 	}
 	for _, issueID := range issueIDs {
-		issue, err := p.loadIssueByID(ctx, db, issueID, true)
+		issue, err := p.loadIssueByID(ctx, db, "export", issueID, true)
 		if err != nil {
 			return Snapshot{}, err
 		}
@@ -539,6 +539,14 @@ func (p *Provider) changeState(ctx context.Context, operation string, locator is
 	key, err := p.resolveIssue(ctx, tx, operation, locator)
 	if err != nil {
 		return issuecore.Issue{}, err
+	}
+
+	issue, err := p.loadIssueByID(ctx, tx, operation, key.IssueID, true)
+	if err != nil {
+		return issuecore.Issue{}, err
+	}
+	if issue.State == state {
+		return issue, nil
 	}
 
 	now := p.now().UTC()
@@ -584,7 +592,7 @@ func (p *Provider) changeState(ctx context.Context, operation string, locator is
 		return issuecore.Issue{}, p.operationError(operation, "storage_error", err)
 	}
 
-	issue, err := p.loadIssueByID(ctx, tx, key.IssueID, true)
+	issue, err = p.loadIssueByID(ctx, tx, operation, key.IssueID, true)
 	if err != nil {
 		return issuecore.Issue{}, err
 	}

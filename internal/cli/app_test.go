@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -395,7 +396,8 @@ func TestRunContextJSONIncludesTrustBoundaryAndTruncation(t *testing.T) {
 			TimelinePayloadMaxRunes int `json:"timeline_payload_max_runes"`
 		} `json:"render_options"`
 		Issue struct {
-			CommentCount int `json:"comment_count"`
+			Title        string `json:"title"`
+			CommentCount int    `json:"comment_count"`
 			Body         struct {
 				Value      string `json:"value"`
 				TrustBound string `json:"trust_boundary"`
@@ -419,6 +421,16 @@ func TestRunContextJSONIncludesTrustBoundaryAndTruncation(t *testing.T) {
 					} `json:"truncation"`
 				} `json:"body"`
 			} `json:"comments"`
+			Timeline []struct {
+				PayloadPreview string `json:"payload_preview"`
+				Truncation     struct {
+					Applied       bool `json:"applied"`
+					OriginalRunes int  `json:"original_runes"`
+					RenderedRunes int  `json:"rendered_runes"`
+					OmittedRunes  int  `json:"omitted_runes"`
+					LimitRunes    int  `json:"limit_runes"`
+				} `json:"payload_preview_truncation"`
+			} `json:"timeline"`
 		} `json:"issue"`
 	}
 	if err := json.Unmarshal(contextOut, &payload); err != nil {
@@ -431,8 +443,14 @@ func TestRunContextJSONIncludesTrustBoundaryAndTruncation(t *testing.T) {
 	if payload.TrustBoundary.ID != issuecore.TrustBoundaryUntrustedUserContent {
 		t.Fatalf("unexpected trust boundary: %+v", payload.TrustBoundary)
 	}
-	if len(payload.TrustBoundary.UntrustedFields) != 2 {
-		t.Fatalf("unexpected untrusted fields: %#v", payload.TrustBoundary.UntrustedFields)
+	if got, want := payload.TrustBoundary.UntrustedFields, []string{
+		"issue.title",
+		"issue.body.value",
+		"issue.comments[].body.value",
+		"issue.timeline[].payload",
+		"issue.timeline[].payload_preview",
+	}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("unexpected untrusted fields: got %#v want %#v", got, want)
 	}
 	if payload.RenderOptions.BodyMaxRunes != 10 || payload.RenderOptions.CommentMaxRunes != 8 || payload.RenderOptions.TimelinePayloadMaxRunes != 12 {
 		t.Fatalf("unexpected render options: %+v", payload.RenderOptions)
@@ -463,13 +481,28 @@ func TestRunContextJSONIncludesTrustBoundaryAndTruncation(t *testing.T) {
 		payload.Issue.Comments[0].Body.Truncation.LimitRunes != 8 {
 		t.Fatalf("unexpected comment truncation: %+v", payload.Issue.Comments[0].Body.Truncation)
 	}
+	if len(payload.Issue.Timeline) == 0 || payload.Issue.Timeline[0].PayloadPreview == "" {
+		t.Fatalf("expected timeline payload preview, got %+v", payload.Issue.Timeline)
+	}
+	if !payload.Issue.Timeline[0].Truncation.Applied || payload.Issue.Timeline[0].Truncation.LimitRunes != 12 {
+		t.Fatalf("unexpected timeline truncation: %+v", payload.Issue.Timeline[0].Truncation)
+	}
 
-	promptOut := string(run("context", "--body-max-runes", "10", "--comment-max-runes", "8", "1"))
+	promptOut := string(run("context", "--body-max-runes", "10", "--comment-max-runes", "8", "--timeline-payload-max-runes", "12", "1"))
 	if !strings.Contains(promptOut, "Trust Boundary:") {
 		t.Fatalf("prompt output missing trust boundary: %q", promptOut)
 	}
+	if !strings.Contains(promptOut, "Title [trust=untrusted_user_content]:") {
+		t.Fatalf("prompt output missing title trust label: %q", promptOut)
+	}
 	if !strings.Contains(promptOut, "truncated: showing 10 of 16 runes") {
 		t.Fatalf("prompt output missing truncation detail: %q", promptOut)
+	}
+	if !strings.Contains(promptOut, "Payload Preview [trust=untrusted_user_content") {
+		t.Fatalf("prompt output missing timeline payload trust label: %q", promptOut)
+	}
+	if !strings.Contains(promptOut, "Payload Preview [trust=untrusted_user_content, truncated: showing 12 of") {
+		t.Fatalf("prompt output missing timeline payload truncation detail: %q", promptOut)
 	}
 }
 
@@ -574,5 +607,130 @@ func TestRunEditDoesNotExposeStateReasonFlag(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "flag provided but not defined: -state-reason") {
 		t.Fatalf("unexpected stderr: %q", stderr.String())
+	}
+}
+
+func TestRunEditRejectsExplicitEmptyTitle(t *testing.T) {
+	t.Parallel()
+
+	app, err := New("test-build")
+	if err != nil {
+		t.Fatalf("new app: %v", err)
+	}
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	app.Stdout = &stdout
+	app.Stderr = &stderr
+
+	dbPath := filepath.Join(t.TempDir(), "issues.db")
+
+	run := func(args ...string) []byte {
+		t.Helper()
+		stdout.Reset()
+		stderr.Reset()
+
+		argv := append([]string{"--db", dbPath}, args...)
+		code := app.Run(context.Background(), argv)
+		if code != 0 {
+			t.Fatalf("run %v: exit=%d stderr=%q stdout=%q", args, code, stderr.String(), stdout.String())
+		}
+
+		return append([]byte(nil), stdout.Bytes()...)
+	}
+
+	run("create", "--title", "reject empty title", "--json")
+
+	stdout.Reset()
+	stderr.Reset()
+	code := app.Run(context.Background(), []string{"--db", dbPath, "edit", "--json", "--title", "", "1"})
+	if code != 1 {
+		t.Fatalf("expected edit failure, got %d with stderr=%q stdout=%q", code, stderr.String(), stdout.String())
+	}
+
+	var payload struct {
+		Error struct {
+			Code      string `json:"code"`
+			Provider  string `json:"provider"`
+			Operation string `json:"operation"`
+			Message   string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("decode error output: %v", err)
+	}
+	if payload.Error.Code != "invalid_argument" || payload.Error.Provider != issuecore.ProviderLocal || payload.Error.Operation != "update" {
+		t.Fatalf("unexpected error payload: %+v", payload.Error)
+	}
+	if !strings.Contains(payload.Error.Message, "issue title cannot be empty") {
+		t.Fatalf("unexpected error message: %q", payload.Error.Message)
+	}
+}
+
+func TestRunReopenNoOpPreservesUpdatedAtAndTimeline(t *testing.T) {
+	t.Parallel()
+
+	app, err := New("test-build")
+	if err != nil {
+		t.Fatalf("new app: %v", err)
+	}
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	app.Stdout = &stdout
+	app.Stderr = &stderr
+
+	dbPath := filepath.Join(t.TempDir(), "issues.db")
+
+	run := func(args ...string) []byte {
+		t.Helper()
+		stdout.Reset()
+		stderr.Reset()
+
+		argv := append([]string{"--db", dbPath}, args...)
+		code := app.Run(context.Background(), argv)
+		if code != 0 {
+			t.Fatalf("run %v: exit=%d stderr=%q stdout=%q", args, code, stderr.String(), stdout.String())
+		}
+
+		return append([]byte(nil), stdout.Bytes()...)
+	}
+
+	createOut := run("create", "--title", "reopen noop", "--json")
+	var createPayload struct {
+		Issue struct {
+			UpdatedAt string `json:"updated_at"`
+		} `json:"issue"`
+	}
+	if err := json.Unmarshal(createOut, &createPayload); err != nil {
+		t.Fatalf("decode create output: %v", err)
+	}
+
+	reopenOut := run("reopen", "--json", "1")
+	var reopenPayload struct {
+		Issue struct {
+			State       string  `json:"state"`
+			StateReason string  `json:"state_reason"`
+			UpdatedAt   string  `json:"updated_at"`
+			ClosedAt    *string `json:"closed_at"`
+			Timeline    []struct {
+				Kind string `json:"kind"`
+			} `json:"timeline"`
+		} `json:"issue"`
+	}
+	if err := json.Unmarshal(reopenOut, &reopenPayload); err != nil {
+		t.Fatalf("decode reopen output: %v", err)
+	}
+	if reopenPayload.Issue.State != "open" || reopenPayload.Issue.StateReason != "" {
+		t.Fatalf("unexpected reopen issue: %+v", reopenPayload.Issue)
+	}
+	if reopenPayload.Issue.UpdatedAt != createPayload.Issue.UpdatedAt {
+		t.Fatalf("updated_at changed on reopen no-op: before=%q after=%q", createPayload.Issue.UpdatedAt, reopenPayload.Issue.UpdatedAt)
+	}
+	if reopenPayload.Issue.ClosedAt != nil {
+		t.Fatalf("closed_at should stay nil on reopen no-op: %+v", reopenPayload.Issue.ClosedAt)
+	}
+	if got := len(reopenPayload.Issue.Timeline); got != 1 || reopenPayload.Issue.Timeline[0].Kind != "created" {
+		t.Fatalf("unexpected timeline after reopen no-op: %+v", reopenPayload.Issue.Timeline)
 	}
 }

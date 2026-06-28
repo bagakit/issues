@@ -334,8 +334,10 @@ func (a *App) runEdit(ctx context.Context, args []string) int {
 	}
 
 	visited := visitedFlags(flags)
-	patch := issuecore.IssuePatch{
-		Title: stringPtr(*title),
+	patch := issuecore.IssuePatch{}
+	if visited["title"] {
+		titleValue := *title
+		patch.Title = &titleValue
 	}
 	if visited["body"] {
 		bodyValue := *body
@@ -638,14 +640,6 @@ func splitCSV(value string) []string {
 		return nil
 	}
 	return out
-}
-
-func stringPtr(value string) *string {
-	if strings.TrimSpace(value) == "" {
-		return nil
-	}
-	copy := value
-	return &copy
 }
 
 func parseLocator(repository, value string) issuecore.IssueLocator {

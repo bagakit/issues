@@ -109,7 +109,7 @@ func (p *Provider) listIssues(ctx context.Context, queryer dbQueryer, query issu
 	}
 
 	for _, key := range keys {
-		issue, err := p.loadIssueByID(ctx, queryer, key.IssueID, false)
+		issue, err := p.loadIssueByID(ctx, queryer, "list", key.IssueID, false)
 		if err != nil {
 			return issuecore.IssuePage{}, err
 		}
@@ -174,19 +174,19 @@ func (p *Provider) resolveIssue(ctx context.Context, queryer dbQueryer, operatio
 	return key, nil
 }
 
-func (p *Provider) loadIssueByID(ctx context.Context, queryer dbQueryer, issueID string, includeDetails bool) (issuecore.Issue, error) {
+func (p *Provider) loadIssueByID(ctx context.Context, queryer dbQueryer, operation, issueID string, includeDetails bool) (issuecore.Issue, error) {
 	record, err := p.loadIssueRecord(ctx, queryer, issueID)
 	if err != nil {
-		return issuecore.Issue{}, err
+		return issuecore.Issue{}, p.withOperation(err, operation)
 	}
 
 	labels, err := p.loadLabels(ctx, queryer, issueID)
 	if err != nil {
-		return issuecore.Issue{}, err
+		return issuecore.Issue{}, p.withOperation(err, operation)
 	}
 	assignees, err := p.loadAssignees(ctx, queryer, issueID)
 	if err != nil {
-		return issuecore.Issue{}, err
+		return issuecore.Issue{}, p.withOperation(err, operation)
 	}
 
 	var comments []issuecore.Comment
@@ -194,19 +194,37 @@ func (p *Provider) loadIssueByID(ctx context.Context, queryer dbQueryer, issueID
 	if includeDetails {
 		comments, err = p.loadComments(ctx, queryer, issueID)
 		if err != nil {
-			return issuecore.Issue{}, err
+			return issuecore.Issue{}, p.withOperation(err, operation)
 		}
 		timeline, err = p.loadTimeline(ctx, queryer, issueID)
 		if err != nil {
-			return issuecore.Issue{}, err
+			return issuecore.Issue{}, p.withOperation(err, operation)
 		}
 	}
 
 	issue, err := buildIssue(record, labels, assignees, comments, timeline)
 	if err != nil {
-		return issuecore.Issue{}, p.operationError("get", "storage_error", err)
+		return issuecore.Issue{}, p.operationError(operation, "storage_error", err)
 	}
 	return issue, nil
+}
+
+func (p *Provider) withOperation(err error, operation string) error {
+	if err == nil {
+		return nil
+	}
+
+	var opErr *issuecore.OperationError
+	if !errors.As(err, &opErr) || opErr.Provider != issuecore.ProviderLocal || opErr.Operation == operation {
+		return err
+	}
+
+	return &issuecore.OperationError{
+		Code:      opErr.Code,
+		Provider:  opErr.Provider,
+		Operation: operation,
+		Err:       opErr.Err,
+	}
 }
 
 func (p *Provider) loadIssueRecord(ctx context.Context, queryer dbQueryer, issueID string) (issueRecord, error) {

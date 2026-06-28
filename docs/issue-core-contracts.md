@@ -29,7 +29,8 @@ top of it. Karp is one client of that core. It does not own issue truth.
 - `issues context <issue>` renders a stable issue-context packet for coding
   agents and future dispatch adapters.
 - Context output keeps GitHub-like issue identity and metadata while marking
-  issue body and comment text as untrusted user content.
+  issue title, issue body, comment text, timeline payloads, and timeline
+  payload previews as untrusted user content.
 - Dispatch types in `pkg/issuecore` define target groups with optional existing
   terminal candidates, terminal reuse vs new terminal creation, new-terminal
   runtime selection, dispatch outcome, and the link to the issue context packet
@@ -37,7 +38,10 @@ top of it. Karp is one client of that core. It does not own issue truth.
 - `issuecore.Service` also exposes provider-agnostic dispatch target listing
   and dispatch submission. Dispatch submission records returned dispatch facts
   back into issue truth through the provider recorder path when the provider
-  supports it.
+  supports it. If delivery succeeds but recorder persistence fails,
+  `SubmitDispatch` returns the delivered `DispatchResult` together with a
+  `PostDeliveryPersistenceError`, and callers must inspect both `result` and
+  `error`.
 
 ## Adapter Responsibilities
 

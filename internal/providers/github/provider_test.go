@@ -244,6 +244,199 @@ func TestPlanMutationsBuildExpectedRequests(t *testing.T) {
 	}
 }
 
+func TestPlanMutationsPreserveBodyWhitespace(t *testing.T) {
+	t.Parallel()
+
+	provider := newTestProvider(t, "test-token", nil)
+	body := "  keep leading and trailing whitespace  \n"
+
+	createPlan, err := provider.PlanCreateIssue(issuecore.CreateIssueInput{
+		Repository: "bagakit/issues",
+		Title:      "ship it",
+		Body:       body,
+	})
+	if err != nil {
+		t.Fatalf("plan create issue: %v", err)
+	}
+	requireJSONBody(t, createPlan.Body, map[string]any{
+		"title": "ship it",
+		"body":  body,
+	})
+
+	updatePlan, err := provider.PlanUpdateIssue(issuecore.IssueLocator{Repository: "bagakit/issues", Number: 9}, issuecore.IssuePatch{
+		Body: stringPtr(body),
+	})
+	if err != nil {
+		t.Fatalf("plan update issue: %v", err)
+	}
+	requireJSONBody(t, updatePlan.Body, map[string]any{
+		"body": body,
+	})
+
+	commentPlan, err := provider.PlanAddComment(issuecore.IssueLocator{Repository: "bagakit/issues", Number: 9}, issuecore.AddCommentInput{
+		Body: body,
+	})
+	if err != nil {
+		t.Fatalf("plan add comment: %v", err)
+	}
+	requireJSONBody(t, commentPlan.Body, map[string]any{
+		"body": body,
+	})
+}
+
+func TestPlanGetIssueAllowsURLOnlyLocator(t *testing.T) {
+	t.Parallel()
+
+	provider := newTestProvider(t, "test-token", nil)
+
+	plan, err := provider.PlanGetIssue(issuecore.IssueLocator{
+		ID: "https://github.com/bagakit/issues/issues/7",
+	})
+	if err != nil {
+		t.Fatalf("plan get issue by url: %v", err)
+	}
+
+	parsedURL, err := url.Parse(plan.URL)
+	if err != nil {
+		t.Fatalf("parse planned url: %v", err)
+	}
+	if parsedURL.Path != "/repos/bagakit/issues/issues/7" {
+		t.Fatalf("unexpected path: %q", parsedURL.Path)
+	}
+}
+
+func TestPlanGetIssueAllowsAPIURLLocator(t *testing.T) {
+	t.Parallel()
+
+	provider := newTestProvider(t, "test-token", nil)
+
+	plan, err := provider.PlanGetIssue(issuecore.IssueLocator{
+		ID: "https://api.github.com/repos/bagakit/issues/issues/7",
+	})
+	if err != nil {
+		t.Fatalf("plan get issue by api url: %v", err)
+	}
+
+	parsedURL, err := url.Parse(plan.URL)
+	if err != nil {
+		t.Fatalf("parse planned url: %v", err)
+	}
+	if parsedURL.Path != "/repos/bagakit/issues/issues/7" {
+		t.Fatalf("unexpected path: %q", parsedURL.Path)
+	}
+}
+
+func TestPlanGetIssueAllowsEnterpriseHTMLURLLocator(t *testing.T) {
+	t.Parallel()
+
+	provider := newTestProviderWithBaseURL(t, "test-token", "https://github.example.com/api/v3/", nil)
+
+	plan, err := provider.PlanGetIssue(issuecore.IssueLocator{
+		ID: "https://github.example.com/bagakit/issues/issues/7",
+	})
+	if err != nil {
+		t.Fatalf("plan get issue by enterprise html url: %v", err)
+	}
+
+	parsedURL, err := url.Parse(plan.URL)
+	if err != nil {
+		t.Fatalf("parse planned url: %v", err)
+	}
+	if parsedURL.Path != "/api/v3/repos/bagakit/issues/issues/7" {
+		t.Fatalf("unexpected path: %q", parsedURL.Path)
+	}
+}
+
+func TestPlanGetIssueAllowsEnterpriseAPIURLLocatorWithBasePath(t *testing.T) {
+	t.Parallel()
+
+	provider := newTestProviderWithBaseURL(t, "test-token", "https://github.example.com/api/v3/", nil)
+
+	plan, err := provider.PlanGetIssue(issuecore.IssueLocator{
+		ID: "https://github.example.com/api/v3/repos/bagakit/issues/issues/7",
+	})
+	if err != nil {
+		t.Fatalf("plan get issue by enterprise api url: %v", err)
+	}
+
+	parsedURL, err := url.Parse(plan.URL)
+	if err != nil {
+		t.Fatalf("parse planned url: %v", err)
+	}
+	if parsedURL.Path != "/api/v3/repos/bagakit/issues/issues/7" {
+		t.Fatalf("unexpected path: %q", parsedURL.Path)
+	}
+}
+
+func TestPlanGetIssueRejectsRepositoryMismatchForURLLocator(t *testing.T) {
+	t.Parallel()
+
+	provider := newTestProvider(t, "test-token", nil)
+
+	_, err := provider.PlanGetIssue(issuecore.IssueLocator{
+		Repository: "other/repo",
+		ID:         "https://github.com/bagakit/issues/issues/7",
+	})
+	if err == nil {
+		t.Fatalf("expected repository mismatch error")
+	}
+
+	var opErr *issuecore.OperationError
+	if !errors.As(err, &opErr) {
+		t.Fatalf("expected OperationError, got %T", err)
+	}
+	if opErr.Code != "invalid_argument" {
+		t.Fatalf("unexpected error code: %q", opErr.Code)
+	}
+	if !strings.Contains(opErr.Error(), "does not match") {
+		t.Fatalf("unexpected error: %v", opErr)
+	}
+}
+
+func TestPlanGetIssueAllowsCaseOnlyRepositoryMatchForURLLocator(t *testing.T) {
+	t.Parallel()
+
+	provider := newTestProvider(t, "test-token", nil)
+
+	plan, err := provider.PlanGetIssue(issuecore.IssueLocator{
+		Repository: "Bagakit/Issues",
+		ID:         "https://github.com/bagakit/issues/issues/7",
+	})
+	if err != nil {
+		t.Fatalf("plan get issue by url with case-only repo difference: %v", err)
+	}
+
+	parsedURL, err := url.Parse(plan.URL)
+	if err != nil {
+		t.Fatalf("parse planned url: %v", err)
+	}
+	if parsedURL.Path != "/repos/bagakit/issues/issues/7" {
+		t.Fatalf("unexpected path: %q", parsedURL.Path)
+	}
+}
+
+func TestPlanGetIssueRejectsNonGitHubURLLocator(t *testing.T) {
+	t.Parallel()
+
+	provider := newTestProvider(t, "test-token", nil)
+
+	_, err := provider.PlanGetIssue(issuecore.IssueLocator{
+		ID: "https://example.com/bagakit/issues/issues/7",
+	})
+	requireInvalidArgument(t, err)
+}
+
+func TestPlanGetIssueRejectsNonIssueURLLocator(t *testing.T) {
+	t.Parallel()
+
+	provider := newTestProvider(t, "test-token", nil)
+
+	_, err := provider.PlanGetIssue(issuecore.IssueLocator{
+		ID: "https://api.github.com/repos/bagakit/issues/issues/7/comments",
+	})
+	requireInvalidArgument(t, err)
+}
+
 func TestListIssuesUsesInjectedClientAndDecodesNumericIDs(t *testing.T) {
 	t.Parallel()
 
@@ -573,7 +766,13 @@ func TestListIssuesMapsGitHubErrors(t *testing.T) {
 func newTestProvider(t *testing.T, token string, doer httpDoer) *Provider {
 	t.Helper()
 
-	provider, err := New(Config{Token: token})
+	return newTestProviderWithBaseURL(t, token, "", doer)
+}
+
+func newTestProviderWithBaseURL(t *testing.T, token, baseURL string, doer httpDoer) *Provider {
+	t.Helper()
+
+	provider, err := New(Config{Token: token, BaseURL: baseURL})
 	if err != nil {
 		t.Fatalf("new provider: %v", err)
 	}
@@ -630,4 +829,19 @@ func stringPtr(value string) *string {
 
 func slicePtr(values []string) *[]string {
 	return &values
+}
+
+func requireInvalidArgument(t *testing.T, err error) {
+	t.Helper()
+
+	if err == nil {
+		t.Fatalf("expected invalid argument error")
+	}
+	var opErr *issuecore.OperationError
+	if !errors.As(err, &opErr) {
+		t.Fatalf("expected OperationError, got %T", err)
+	}
+	if opErr.Code != "invalid_argument" {
+		t.Fatalf("unexpected error code: %q", opErr.Code)
+	}
 }

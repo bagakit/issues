@@ -298,7 +298,7 @@ func (p *Provider) PlanCreateIssue(input issuecore.CreateIssueInput) (RequestPla
 	}
 
 	payload := map[string]any{"title": title}
-	if body := strings.TrimSpace(input.Body); body != "" {
+	if body := input.Body; strings.TrimSpace(body) != "" {
 		payload["body"] = body
 	}
 	if labels := normalizeSet(input.Labels); len(labels) > 0 {
@@ -333,7 +333,7 @@ func (p *Provider) PlanUpdateIssue(locator issuecore.IssueLocator, patch issueco
 		payload["title"] = title
 	}
 	if patch.Body != nil {
-		payload["body"] = strings.TrimSpace(*patch.Body)
+		payload["body"] = *patch.Body
 	}
 	if patch.Labels != nil {
 		payload["labels"] = normalizeSet(*patch.Labels)
@@ -351,13 +351,12 @@ func (p *Provider) PlanAddComment(locator issuecore.IssueLocator, input issuecor
 	if err != nil {
 		return RequestPlan{}, err
 	}
-	body := strings.TrimSpace(input.Body)
-	if body == "" {
+	if strings.TrimSpace(input.Body) == "" {
 		return RequestPlan{}, p.operationError("comment", "invalid_argument", fmt.Errorf("comment body is required"))
 	}
 
 	u := p.endpointURL("repos/" + url.PathEscape(repo.Owner) + "/" + url.PathEscape(repo.Repo) + "/issues/" + strconv.Itoa(number) + "/comments")
-	return buildPlan("comment", http.MethodPost, u, map[string]any{"body": body})
+	return buildPlan("comment", http.MethodPost, u, map[string]any{"body": input.Body})
 }
 
 func (p *Provider) PlanCloseIssue(locator issuecore.IssueLocator, input issuecore.CloseIssueInput) (RequestPlan, error) {
@@ -731,34 +730,47 @@ func (p *Provider) parsePageToken(token string) (*url.URL, error) {
 }
 
 func (p *Provider) resolveIssue(locator issuecore.IssueLocator, operation string) (repositoryRef, int, error) {
-	repo, err := parseRepository(locator.Repository)
-	if err != nil {
-		return repositoryRef{}, 0, p.operationError(operation, "invalid_argument", err)
+	repository := strings.TrimSpace(locator.Repository)
+
+	var (
+		repo    repositoryRef
+		hasRepo bool
+		err     error
+	)
+	if repository != "" {
+		repo, err = parseRepository(repository)
+		if err != nil {
+			return repositoryRef{}, 0, p.operationError(operation, "invalid_argument", err)
+		}
+		hasRepo = true
 	}
 
 	if locator.Number > 0 {
+		if !hasRepo {
+			return repositoryRef{}, 0, p.operationError(operation, "invalid_argument", fmt.Errorf("github provider requires a repository when using a numeric issue identifier"))
+		}
 		return repo, locator.Number, nil
 	}
 
 	id := strings.TrimSpace(locator.ID)
 	if id == "" {
-		return repositoryRef{}, 0, p.operationError(operation, "invalid_argument", fmt.Errorf("issue locator requires a number or URL"))
+		return repositoryRef{}, 0, p.operationError(operation, "invalid_argument", fmt.Errorf("issue locator requires a numeric issue identifier or issue URL"))
 	}
 	if number, err := strconv.Atoi(id); err == nil && number > 0 {
+		if !hasRepo {
+			return repositoryRef{}, 0, p.operationError(operation, "invalid_argument", fmt.Errorf("github provider requires a repository when using a numeric issue identifier"))
+		}
 		return repo, number, nil
 	}
 
-	if u, err := url.Parse(id); err == nil {
-		segments := strings.Split(strings.Trim(u.Path, "/"), "/")
-		if len(segments) > 0 {
-			last := segments[len(segments)-1]
-			if number, err := strconv.Atoi(last); err == nil && number > 0 {
-				return repo, number, nil
-			}
+	if urlRepo, number, ok := p.parseIssueURL(id); ok {
+		if hasRepo && !sameRepository(repo, urlRepo) {
+			return repositoryRef{}, 0, p.operationError(operation, "invalid_argument", fmt.Errorf("issue URL repository %q does not match locator repository %q", urlRepo.String(), repo.String()))
 		}
+		return urlRepo, number, nil
 	}
 
-	return repositoryRef{}, 0, p.operationError(operation, "invalid_argument", fmt.Errorf("github provider requires a numeric issue identifier"))
+	return repositoryRef{}, 0, p.operationError(operation, "invalid_argument", fmt.Errorf("github provider requires a numeric issue identifier or issue URL"))
 }
 
 func (p *Provider) operationError(operation, code string, err error) error {
@@ -1005,6 +1017,95 @@ func nextPageToken(linkHeader string) string {
 		}
 	}
 	return ""
+}
+
+func (p *Provider) parseIssueURL(raw string) (repositoryRef, int, bool) {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || !u.IsAbs() {
+		return repositoryRef{}, 0, false
+	}
+
+	host := normalizeURLHost(u.Host)
+	if host == "" {
+		return repositoryRef{}, 0, false
+	}
+
+	baseHost := ""
+	var basePath []string
+	if p != nil && p.baseURL != nil {
+		baseHost = normalizeURLHost(p.baseURL.Host)
+		basePath = pathSegments(p.baseURL.Path)
+	}
+
+	parts := pathSegments(u.Path)
+	if host == "github.com" || (baseHost != "" && host == baseHost && baseHost != "api.github.com") {
+		if repo, number, ok := parseHTMLIssuePath(parts); ok {
+			return repo, number, true
+		}
+	}
+
+	if baseHost != "" && host == baseHost {
+		if repo, number, ok := parseAPIIssuePath(stripPathPrefix(parts, basePath)); ok {
+			return repo, number, true
+		}
+	}
+
+	return repositoryRef{}, 0, false
+}
+
+func normalizeURLHost(host string) string {
+	host = strings.ToLower(strings.TrimSpace(host))
+	host = strings.TrimPrefix(host, "www.")
+	return host
+}
+
+func pathSegments(raw string) []string {
+	raw = strings.Trim(raw, "/")
+	if raw == "" {
+		return nil
+	}
+	return strings.Split(raw, "/")
+}
+
+func stripPathPrefix(parts, prefix []string) []string {
+	if len(prefix) == 0 {
+		return parts
+	}
+	if len(parts) < len(prefix) {
+		return nil
+	}
+	for i := range prefix {
+		if parts[i] != prefix[i] {
+			return nil
+		}
+	}
+	return parts[len(prefix):]
+}
+
+func parseAPIIssuePath(parts []string) (repositoryRef, int, bool) {
+	if len(parts) != 5 || parts[0] != "repos" || parts[3] != "issues" {
+		return repositoryRef{}, 0, false
+	}
+	return repositoryAndNumberFromParts(parts[1], parts[2], parts[4])
+}
+
+func parseHTMLIssuePath(parts []string) (repositoryRef, int, bool) {
+	if len(parts) != 4 || (parts[2] != "issues" && parts[2] != "pull") {
+		return repositoryRef{}, 0, false
+	}
+	return repositoryAndNumberFromParts(parts[0], parts[1], parts[3])
+}
+
+func repositoryAndNumberFromParts(owner, repo, rawNumber string) (repositoryRef, int, bool) {
+	number, err := strconv.Atoi(rawNumber)
+	if err != nil || number <= 0 {
+		return repositoryRef{}, 0, false
+	}
+	return repositoryRef{Owner: owner, Repo: repo}, number, true
+}
+
+func sameRepository(left, right repositoryRef) bool {
+	return strings.EqualFold(left.Owner, right.Owner) && strings.EqualFold(left.Repo, right.Repo)
 }
 
 func repositoryFromAPIURL(raw string) string {
