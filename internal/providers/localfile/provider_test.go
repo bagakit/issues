@@ -211,6 +211,93 @@ func TestProviderSerializesConcurrentCreatesAcrossInstances(t *testing.T) {
 	}
 }
 
+func TestProviderReadersWaitForCommittedRecordSetsAcrossInstances(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	gate := newIssueDocumentGate()
+
+	writer := newGatedTestProvider(t, root, gate)
+	lister := newGatedTestProvider(t, root, gate)
+	getter := newGatedTestProvider(t, root, gate)
+	ctx := context.Background()
+
+	created, err := writer.CreateIssue(ctx, issuecore.CreateIssueInput{
+		Repository: "bagakit/issues",
+		Title:      "concurrent comment",
+	})
+	if err != nil {
+		t.Fatalf("create issue: %v", err)
+	}
+
+	gate.arm()
+	defer gate.release()
+
+	commentDone := make(chan error, 1)
+	go func() {
+		_, err := writer.AddComment(ctx, issuecore.IssueLocator{Number: created.Number, Repository: created.Repository}, issuecore.AddCommentInput{
+			Body: "first comment",
+		})
+		commentDone <- err
+	}()
+
+	waitForGateStart(t, gate.started, "blocked issue document write")
+
+	listDone := make(chan error, 1)
+	go func() {
+		_, err := lister.ListIssues(ctx, issuecore.ListIssuesQuery{
+			Repository: created.Repository,
+			State:      issuecore.IssueStateFilterAll,
+		})
+		listDone <- err
+	}()
+
+	getDone := make(chan error, 1)
+	go func() {
+		_, err := getter.GetIssue(ctx, issuecore.IssueLocator{
+			Number:     created.Number,
+			Repository: created.Repository,
+		})
+		getDone <- err
+	}()
+
+	ensureNoGateSignal(t, gate.readDuringBlock, "reader touched the store while a commit was in flight")
+
+	gate.release()
+
+	if err := <-commentDone; err != nil {
+		t.Fatalf("add comment: %v", err)
+	}
+	if err := <-listDone; err != nil {
+		t.Fatalf("list issues after write release: %v", err)
+	}
+	if err := <-getDone; err != nil {
+		t.Fatalf("get issue after write release: %v", err)
+	}
+
+	page, err := lister.ListIssues(ctx, issuecore.ListIssuesQuery{
+		Repository: created.Repository,
+		State:      issuecore.IssueStateFilterAll,
+	})
+	if err != nil {
+		t.Fatalf("list issues after release: %v", err)
+	}
+	if len(page.Issues) != 1 || page.Issues[0].Comments != 1 {
+		t.Fatalf("unexpected listed issues after release: %+v", page.Issues)
+	}
+
+	got, err := getter.GetIssue(ctx, issuecore.IssueLocator{
+		Number:     created.Number,
+		Repository: created.Repository,
+	})
+	if err != nil {
+		t.Fatalf("get issue after release: %v", err)
+	}
+	if got.Comments != 1 || len(got.CommentItems) != 1 || got.CommentItems[0].Body != "first comment" {
+		t.Fatalf("unexpected issue after release: %+v", got)
+	}
+}
+
 func TestProviderCreateFailureLeavesNoIndexVisiblePartialIssue(t *testing.T) {
 	t.Parallel()
 
@@ -243,6 +330,82 @@ func TestProviderCreateFailureLeavesNoIndexVisiblePartialIssue(t *testing.T) {
 	}
 	if len(page.Issues) != 0 {
 		t.Fatalf("failed create should not be index-visible: %+v", page.Issues)
+	}
+}
+
+func TestProviderUpdateSerializesAcrossInstances(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	gate := newIssueDocumentGate()
+
+	first := newGatedTestProvider(t, root, gate)
+	second := newGatedTestProvider(t, root, gate)
+	reader := newGatedTestProvider(t, root, gate)
+	ctx := context.Background()
+
+	created, err := first.CreateIssue(ctx, issuecore.CreateIssueInput{
+		Repository: "bagakit/issues",
+		Title:      "original title",
+	})
+	if err != nil {
+		t.Fatalf("create issue: %v", err)
+	}
+
+	gate.arm()
+	defer gate.release()
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := first.UpdateIssue(ctx, issuecore.IssueLocator{
+			Number:     created.Number,
+			Repository: created.Repository,
+		}, issuecore.IssuePatch{
+			Title: stringPtr("first title"),
+		})
+		firstDone <- err
+	}()
+
+	waitForGateStart(t, gate.started, "blocked update issue document write")
+
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := second.UpdateIssue(ctx, issuecore.IssueLocator{
+			Number:     created.Number,
+			Repository: created.Repository,
+		}, issuecore.IssuePatch{
+			Title: stringPtr("second title"),
+		})
+		secondDone <- err
+	}()
+
+	ensureNoGateSignal(t, gate.readDuringBlock, "second update touched store reads while the first update was in flight")
+	ensureNoGateSignal(t, gate.writeDuringBlock, "second update touched store writes while the first update was in flight")
+
+	gate.release()
+
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first update: %v", err)
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatalf("second update: %v", err)
+	}
+
+	got, err := reader.GetIssue(ctx, issuecore.IssueLocator{
+		Number:     created.Number,
+		Repository: created.Repository,
+	})
+	if err != nil {
+		t.Fatalf("get issue after updates: %v", err)
+	}
+	if got.Title != "second title" {
+		t.Fatalf("unexpected final title: %+v", got)
+	}
+	if got.Comments != 0 {
+		t.Fatalf("unexpected comments after updates: %+v", got)
+	}
+	if gotKinds := timelineKinds(got.Timeline); !reflect.DeepEqual(gotKinds, []string{"created", "updated", "updated"}) {
+		t.Fatalf("unexpected timeline after serialized updates: %#v", gotKinds)
 	}
 }
 
@@ -417,10 +580,26 @@ func TestProviderRecordDispatchPersistsCanonicalFileAndContext(t *testing.T) {
 func newTestProvider(t *testing.T, root string) *Provider {
 	t.Helper()
 
-	provider, err := New(Config{
+	return newConfiguredTestProvider(t, Config{
 		Path: root,
 		Now:  sequentialClock(time.Date(2024, time.January, 2, 1, 0, 0, 0, time.UTC)),
 	})
+}
+
+func newGatedTestProvider(t *testing.T, root string, gate *issueDocumentGate) *Provider {
+	t.Helper()
+
+	return newConfiguredTestProvider(t, Config{
+		Path:  root,
+		Store: newGatedFileSystemStore(t, root, gate),
+		Now:   sequentialClock(time.Date(2024, time.January, 2, 1, 0, 0, 0, time.UTC)),
+	})
+}
+
+func newConfiguredTestProvider(t *testing.T, cfg Config) *Provider {
+	t.Helper()
+
+	provider, err := New(cfg)
 	if err != nil {
 		t.Fatalf("new provider: %v", err)
 	}
@@ -438,6 +617,133 @@ func (store *failIssueDocumentWriteStore) Write(ctx context.Context, record issu
 		return issuecore.LogicalRecord{}, errors.New("injected issue document write failure")
 	}
 	return store.LogicalStore.Write(ctx, record, expect, createOnly)
+}
+
+type gatedFileSystemStore struct {
+	*issuecore.FileSystemStore
+	gate *issueDocumentGate
+}
+
+func newGatedFileSystemStore(t *testing.T, root string, gate *issueDocumentGate) *gatedFileSystemStore {
+	t.Helper()
+
+	base, err := issuecore.NewFileSystemStore(root)
+	if err != nil {
+		t.Fatalf("new filesystem store: %v", err)
+	}
+	return &gatedFileSystemStore{
+		FileSystemStore: base,
+		gate:            gate,
+	}
+}
+
+func (store *gatedFileSystemStore) Read(ctx context.Context, path issuecore.LogicalPath) (issuecore.LogicalRecord, error) {
+	store.gate.noteRead()
+	return store.FileSystemStore.Read(ctx, path)
+}
+
+func (store *gatedFileSystemStore) Write(ctx context.Context, record issuecore.LogicalRecord, expect issuecore.RecordVersion, createOnly bool) (issuecore.LogicalRecord, error) {
+	store.gate.beforeWrite(record)
+	return store.FileSystemStore.Write(ctx, record, expect, createOnly)
+}
+
+func (store *gatedFileSystemStore) List(ctx context.Context, req issuecore.ListRequest) ([]issuecore.ListEntry, string, error) {
+	store.gate.noteRead()
+	return store.FileSystemStore.List(ctx, req)
+}
+
+type issueDocumentGate struct {
+	mu               sync.Mutex
+	armed            bool
+	blocking         bool
+	started          chan struct{}
+	releaseCh        chan struct{}
+	releaseOnce      sync.Once
+	readDuringBlock  chan struct{}
+	writeDuringBlock chan struct{}
+}
+
+func newIssueDocumentGate() *issueDocumentGate {
+	return &issueDocumentGate{
+		started:          make(chan struct{}),
+		releaseCh:        make(chan struct{}),
+		readDuringBlock:  make(chan struct{}, 1),
+		writeDuringBlock: make(chan struct{}, 1),
+	}
+}
+
+func (gate *issueDocumentGate) arm() {
+	gate.mu.Lock()
+	defer gate.mu.Unlock()
+	gate.armed = true
+}
+
+func (gate *issueDocumentGate) noteRead() {
+	gate.mu.Lock()
+	blocking := gate.blocking
+	ch := gate.readDuringBlock
+	gate.mu.Unlock()
+	if blocking {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func (gate *issueDocumentGate) beforeWrite(record issuecore.LogicalRecord) {
+	gate.mu.Lock()
+	switch {
+	case gate.blocking:
+		ch := gate.writeDuringBlock
+		gate.mu.Unlock()
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+		return
+	case gate.armed && isIssueDocumentRecord(record):
+		gate.armed = false
+		gate.blocking = true
+		started := gate.started
+		release := gate.releaseCh
+		gate.mu.Unlock()
+		close(started)
+		<-release
+		gate.mu.Lock()
+		gate.blocking = false
+		gate.mu.Unlock()
+		return
+	default:
+		gate.mu.Unlock()
+		return
+	}
+}
+
+func (gate *issueDocumentGate) release() {
+	gate.releaseOnce.Do(func() {
+		close(gate.releaseCh)
+	})
+}
+
+func waitForGateStart(t *testing.T, ch <-chan struct{}, name string) {
+	t.Helper()
+
+	select {
+	case <-ch:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for %s", name)
+	}
+}
+
+func ensureNoGateSignal(t *testing.T, ch <-chan struct{}, message string) {
+	t.Helper()
+
+	select {
+	case <-ch:
+		t.Fatal(message)
+	case <-time.After(150 * time.Millisecond):
+	}
 }
 
 func sequentialClock(base time.Time) func() time.Time {

@@ -163,8 +163,11 @@ func (p *Provider) CreateIssue(ctx context.Context, input issuecore.CreateIssueI
 }
 
 func (p *Provider) ListIssues(ctx context.Context, query issuecore.ListIssuesQuery) (issuecore.IssuePage, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	unlock, err := p.lockRead(ctx)
+	if err != nil {
+		return issuecore.IssuePage{}, p.operationError("list", "storage_error", err)
+	}
+	defer unlock()
 
 	store, err := p.ensureStore(ctx, "list")
 	if err != nil {
@@ -182,8 +185,11 @@ func (p *Provider) ListIssues(ctx context.Context, query issuecore.ListIssuesQue
 }
 
 func (p *Provider) GetIssue(ctx context.Context, locator issuecore.IssueLocator) (issuecore.Issue, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	unlock, err := p.lockRead(ctx)
+	if err != nil {
+		return issuecore.Issue{}, p.operationError("get", "storage_error", err)
+	}
+	defer unlock()
 
 	store, err := p.ensureStore(ctx, "get")
 	if err != nil {
@@ -204,8 +210,11 @@ func (p *Provider) UpdateIssue(ctx context.Context, locator issuecore.IssueLocat
 		return issuecore.Issue{}, p.operationError("update", "invalid_argument", errors.New("local provider only accepts state_reason via close or reopen"))
 	}
 
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	unlock, err := p.lockMutations(ctx)
+	if err != nil {
+		return issuecore.Issue{}, p.operationError("update", "storage_error", err)
+	}
+	defer unlock()
 
 	store, err := p.ensureStore(ctx, "update")
 	if err != nil {
@@ -444,7 +453,17 @@ func (p *Provider) ensureStore(ctx context.Context, operation string) (issuecore
 	return p.store, nil
 }
 
+func (p *Provider) lockRead(ctx context.Context) (func(), error) {
+	// Reads can initialize the store manifest through ensureStore, so keep the
+	// file-backed lock exclusive rather than allowing concurrent first readers.
+	return p.lockStore(ctx, unix.LOCK_EX)
+}
+
 func (p *Provider) lockMutations(ctx context.Context) (func(), error) {
+	return p.lockStore(ctx, unix.LOCK_EX)
+}
+
+func (p *Provider) lockStore(ctx context.Context, flockOp int) (func(), error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -466,7 +485,7 @@ func (p *Provider) lockMutations(ctx context.Context) (func(), error) {
 			mu.Unlock()
 			return nil, err
 		}
-		if err := unix.Flock(int(file.Fd()), unix.LOCK_EX); err != nil {
+		if err := unix.Flock(int(file.Fd()), flockOp); err != nil {
 			_ = file.Close()
 			mu.Unlock()
 			return nil, err
