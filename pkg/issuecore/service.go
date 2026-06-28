@@ -227,6 +227,34 @@ func (s *Service) SubmitDispatch(ctx context.Context, provider string, request D
 	return result, nil
 }
 
+func (s *Service) RecordDispatch(ctx context.Context, provider string, locator IssueLocator, record DispatchRecord) (Issue, error) {
+	backend, err := s.provider(provider, "dispatch")
+	if err != nil {
+		return Issue{}, err
+	}
+
+	recorder, ok := backend.(DispatchRecorder)
+	if !ok {
+		return Issue{}, NotImplemented(provider, "dispatch")
+	}
+
+	issue, err := backend.GetIssue(ctx, withProvider(locator, provider))
+	if err != nil {
+		return Issue{}, err
+	}
+	issue = normalizeIssue(issue, provider)
+	record = normalizeDispatchRecord(issue, record)
+	if err := record.Validate(); err != nil {
+		return Issue{}, InvalidInput(provider, "dispatch", err)
+	}
+
+	recorded, err := recorder.RecordDispatch(ctx, dispatchIssueLocator(issue), record)
+	if err != nil {
+		return Issue{}, err
+	}
+	return normalizeIssue(recorded, provider), nil
+}
+
 func (s *Service) provider(name, operation string) (Provider, error) {
 	if name == "" {
 		return nil, ProviderRequiredError(operation)
@@ -257,6 +285,11 @@ func normalizeDispatchRequest(issue Issue, request DispatchRequest) DispatchRequ
 	request.Issue = dispatchIssueLocator(issue)
 	request.IssueContext = mergeIssueContextLink(NewIssueContextLink(issue, ContextFormatJSON), request.IssueContext)
 	return request
+}
+
+func normalizeDispatchRecord(issue Issue, record DispatchRecord) DispatchRecord {
+	record.IssueContext = mergeIssueContextLink(NewIssueContextLink(issue, ContextFormatJSON), record.IssueContext)
+	return record
 }
 
 func normalizeDispatchResult(request DispatchRequest, result DispatchResult) (DispatchResult, error) {

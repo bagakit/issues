@@ -110,6 +110,9 @@ func (p *Provider) CreateIssue(ctx context.Context, input issuecore.CreateIssueI
 	if title == "" {
 		return issuecore.Issue{}, p.operationError("create", "invalid_argument", errors.New("issue title is required"))
 	}
+	if strings.TrimSpace(input.Milestone) != "" {
+		return issuecore.Issue{}, p.operationError("create", "invalid_argument", errors.New("legacy sqlite local provider does not support milestones"))
+	}
 
 	db, err := p.ensureDB(ctx, "create", p.path, p.now)
 	if err != nil {
@@ -216,6 +219,9 @@ func (p *Provider) UpdateIssue(ctx context.Context, locator issuecore.IssueLocat
 	}
 	if patch.StateReason != nil {
 		return issuecore.Issue{}, p.operationError("update", "invalid_argument", errors.New("local provider only accepts state_reason via close or reopen"))
+	}
+	if patch.Milestone != nil {
+		return issuecore.Issue{}, p.operationError("update", "invalid_argument", errors.New("legacy sqlite local provider does not support milestones"))
 	}
 
 	db, err := p.ensureDB(ctx, "update", p.path, p.now)
@@ -617,5 +623,6 @@ func emptyIssuePatch(patch issuecore.IssuePatch) bool {
 		patch.Body == nil &&
 		patch.Labels == nil &&
 		patch.Assignees == nil &&
+		patch.Milestone == nil &&
 		patch.StateReason == nil
 }

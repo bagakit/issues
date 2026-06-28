@@ -1,9 +1,10 @@
-package cli
+package app
 
 import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -93,6 +94,54 @@ func TestRunGitHubListJSONReturnsStructuredConfigError(t *testing.T) {
 	}
 }
 
+func TestRunGitHubListJSONReturnsStructuredUnsupportedCapability(t *testing.T) {
+	t.Parallel()
+
+	app, err := New("test-build")
+	if err != nil {
+		t.Fatalf("new app: %v", err)
+	}
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	app.Stdout = &stdout
+	app.Stderr = &stderr
+
+	code := app.Run(context.Background(), []string{"list", "--provider", "github", "--repository", "bagakit/issues", "--search", "text", "--json"})
+	if code != 1 {
+		t.Fatalf("expected failure exit code 1, got %d with stderr %q", code, stderr.String())
+	}
+
+	var payload struct {
+		Error struct {
+			Code                  string `json:"code"`
+			Provider              string `json:"provider"`
+			Operation             string `json:"operation"`
+			UnsupportedCapability struct {
+				Interface          string `json:"interface"`
+				Field              string `json:"field"`
+				Behavior           string `json:"behavior"`
+				CompatibilityLevel string `json:"compatibility_level"`
+				Reason             string `json:"reason"`
+			} `json:"unsupported_capability"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("decode output: %v", err)
+	}
+
+	if payload.Error.Code != "unsupported_capability" || payload.Error.Provider != "github" || payload.Error.Operation != "list" {
+		t.Fatalf("unexpected error header: %+v", payload.Error)
+	}
+	if payload.Error.UnsupportedCapability.Interface != "github_rest" ||
+		payload.Error.UnsupportedCapability.Field != "search" ||
+		payload.Error.UnsupportedCapability.Behavior != "repository_issue_text_search" ||
+		payload.Error.UnsupportedCapability.CompatibilityLevel != "unsupported" ||
+		payload.Error.UnsupportedCapability.Reason == "" {
+		t.Fatalf("unexpected unsupported capability: %+v", payload.Error.UnsupportedCapability)
+	}
+}
+
 func TestParseGlobalArgsUsesGitHubEnvFallbacks(t *testing.T) {
 	t.Setenv(githubTokenEnv, "issues-token")
 	t.Setenv(githubTokenGHEnv, "gh-token")
@@ -134,6 +183,31 @@ func TestParseGlobalArgsGitHubFlagsOverrideEnv(t *testing.T) {
 	}
 	if options.GitHubBaseURL != "https://flag.example/api/v3" {
 		t.Fatalf("unexpected github base url override: %q", options.GitHubBaseURL)
+	}
+}
+
+func TestParseGlobalArgsLocalRootOverridesCompatibilityEnv(t *testing.T) {
+	t.Setenv(localStoreEnv, "/tmp/issues-root")
+	t.Setenv(localStoreCompatEnv, "/tmp/issues-store")
+	t.Setenv(localDatabaseEnv, "/tmp/issues.db")
+
+	options, remaining, err := parseGlobalArgs([]string{"--local-root", "/tmp/flag-root", "version"})
+	if err != nil {
+		t.Fatalf("parse global args: %v", err)
+	}
+	if len(remaining) != 1 || remaining[0] != "version" {
+		t.Fatalf("unexpected remaining args: %#v", remaining)
+	}
+	if options.LocalStorePath != "/tmp/flag-root" {
+		t.Fatalf("unexpected local root override: %q", options.LocalStorePath)
+	}
+
+	options, _, err = parseGlobalArgs([]string{"version"})
+	if err != nil {
+		t.Fatalf("parse env global args: %v", err)
+	}
+	if options.LocalStorePath != "/tmp/issues-root" {
+		t.Fatalf("unexpected local root env precedence: %q", options.LocalStorePath)
 	}
 }
 
@@ -206,7 +280,7 @@ func TestRunLocalProviderSmoke(t *testing.T) {
 		return append([]byte(nil), stdout.Bytes()...)
 	}
 
-	createOut := run("create", "--title", "T-002 smoke", "--body", "local provider", "--labels", "zeta,alpha", "--assignees", "bob,alice", "--json")
+	createOut := run("create", "--title", "T-002 smoke", "--body", "local provider", "--labels", "zeta,alpha", "--assignees", "bob,alice", "--milestone", "v1", "--json")
 	var createPayload struct {
 		Issue struct {
 			ID     string `json:"id"`
@@ -218,6 +292,9 @@ func TestRunLocalProviderSmoke(t *testing.T) {
 			Assignees []struct {
 				Login string `json:"login"`
 			} `json:"assignees"`
+			Milestone *struct {
+				Title string `json:"title"`
+			} `json:"milestone"`
 		} `json:"issue"`
 	}
 	if err := json.Unmarshal(createOut, &createPayload); err != nil {
@@ -231,6 +308,9 @@ func TestRunLocalProviderSmoke(t *testing.T) {
 	}
 	if got := []string{createPayload.Issue.Assignees[0].Login, createPayload.Issue.Assignees[1].Login}; got[0] != "alice" || got[1] != "bob" {
 		t.Fatalf("assignees not normalized: %#v", got)
+	}
+	if createPayload.Issue.Milestone == nil || createPayload.Issue.Milestone.Title != "v1" {
+		t.Fatalf("unexpected milestone: %+v", createPayload.Issue.Milestone)
 	}
 
 	listOut := run("list", "--json")
@@ -266,7 +346,7 @@ func TestRunLocalProviderSmoke(t *testing.T) {
 		t.Fatalf("unexpected view payload: %+v", viewPayload.Issue)
 	}
 
-	editOut := run("edit", "--json", "--title", "T-002 edited", "--labels", "beta,alpha", "--assignees", "alice", "1")
+	editOut := run("edit", "--json", "--title", "T-002 edited", "--labels", "beta,alpha", "--assignees", "alice", "--milestone", "v2", "1")
 	var editPayload struct {
 		Issue struct {
 			Title  string `json:"title"`
@@ -276,6 +356,9 @@ func TestRunLocalProviderSmoke(t *testing.T) {
 			Assignees []struct {
 				Login string `json:"login"`
 			} `json:"assignees"`
+			Milestone *struct {
+				Title string `json:"title"`
+			} `json:"milestone"`
 		} `json:"issue"`
 	}
 	if err := json.Unmarshal(editOut, &editPayload); err != nil {
@@ -289,6 +372,9 @@ func TestRunLocalProviderSmoke(t *testing.T) {
 	}
 	if len(editPayload.Issue.Assignees) != 1 || editPayload.Issue.Assignees[0].Login != "alice" {
 		t.Fatalf("unexpected assignees after edit: %#v", editPayload.Issue.Assignees)
+	}
+	if editPayload.Issue.Milestone == nil || editPayload.Issue.Milestone.Title != "v2" {
+		t.Fatalf("unexpected milestone after edit: %+v", editPayload.Issue.Milestone)
 	}
 
 	commentOut := run("comment", "--json", "--body", "first comment", "1")
@@ -503,6 +589,185 @@ func TestRunContextJSONIncludesTrustBoundaryAndTruncation(t *testing.T) {
 	}
 	if !strings.Contains(promptOut, "Payload Preview [trust=untrusted_user_content, truncated: showing 12 of") {
 		t.Fatalf("prompt output missing timeline payload truncation detail: %q", promptOut)
+	}
+}
+
+func TestRunRecordDispatchPersistsAndContextShowsDispatch(t *testing.T) {
+	t.Parallel()
+
+	app, err := New("test-build")
+	if err != nil {
+		t.Fatalf("new app: %v", err)
+	}
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	app.Stdout = &stdout
+	app.Stderr = &stderr
+
+	localRoot := filepath.Join(t.TempDir(), "issues-root")
+
+	run := func(args ...string) []byte {
+		t.Helper()
+		stdout.Reset()
+		stderr.Reset()
+
+		argv := append([]string{"--local-root", localRoot}, args...)
+		code := app.Run(context.Background(), argv)
+		if code != 0 {
+			t.Fatalf("run %v: exit=%d stderr=%q stdout=%q", args, code, stderr.String(), stdout.String())
+		}
+
+		return append([]byte(nil), stdout.Bytes()...)
+	}
+
+	createOut := run("create", "--repository", "bagakit/issues", "--title", "dispatch cli", "--body", "dispatch context", "--json")
+	var createPayload struct {
+		Issue struct {
+			ID     string `json:"id"`
+			Number int    `json:"number"`
+		} `json:"issue"`
+	}
+	if err := json.Unmarshal(createOut, &createPayload); err != nil {
+		t.Fatalf("decode create output: %v", err)
+	}
+	if createPayload.Issue.ID == "" || createPayload.Issue.Number != 1 {
+		t.Fatalf("unexpected create payload: %+v", createPayload.Issue)
+	}
+
+	dispatchOut := run(
+		"record-dispatch",
+		"--repository", "bagakit/issues",
+		"--dispatch-id", "dispatch-cli-1",
+		"--target-group", "grp-1",
+		"--target-group-name", "Spec",
+		"--terminal-mode", "reuse_existing",
+		"--terminal-id", "term-7",
+		"--terminal-title", "Worker 7",
+		"--runtime-identity", "codex/gpt-5",
+		"--outcome", "delivered",
+		"--dispatched-at", "2024-01-02T02:00:00Z",
+		"--context-format", "prompt",
+		"--json",
+		"1",
+	)
+	var dispatchPayload struct {
+		Dispatch struct {
+			ID          string `json:"id"`
+			TargetGroup struct {
+				ID   string `json:"id"`
+				Name string `json:"name"`
+			} `json:"target_group"`
+			Terminal struct {
+				Mode     string `json:"mode"`
+				Existing struct {
+					ID              string `json:"id"`
+					RuntimeIdentity string `json:"runtime_identity"`
+				} `json:"existing_terminal"`
+			} `json:"terminal"`
+			Outcome      string `json:"outcome"`
+			IssueContext struct {
+				SchemaVersion string `json:"schema_version"`
+				Format        string `json:"format"`
+				Provider      string `json:"provider"`
+				Repository    string `json:"repository"`
+				IssueID       string `json:"issue_id"`
+				IssueNumber   int    `json:"issue_number"`
+			} `json:"issue_context"`
+		} `json:"dispatch"`
+		Issue struct {
+			Dispatch *struct {
+				Latest struct {
+					ID string `json:"id"`
+				} `json:"latest"`
+			} `json:"dispatch"`
+		} `json:"issue"`
+	}
+	if err := json.Unmarshal(dispatchOut, &dispatchPayload); err != nil {
+		t.Fatalf("decode dispatch output: %v", err)
+	}
+	if dispatchPayload.Dispatch.ID != "dispatch-cli-1" ||
+		dispatchPayload.Dispatch.TargetGroup.ID != "grp-1" ||
+		dispatchPayload.Dispatch.Terminal.Mode != "reuse_existing" ||
+		dispatchPayload.Dispatch.Terminal.Existing.ID != "term-7" ||
+		dispatchPayload.Dispatch.Terminal.Existing.RuntimeIdentity != "codex/gpt-5" ||
+		dispatchPayload.Dispatch.Outcome != "delivered" {
+		t.Fatalf("unexpected dispatch payload: %+v", dispatchPayload.Dispatch)
+	}
+	if dispatchPayload.Dispatch.IssueContext.SchemaVersion != issuecore.ContextSchemaVersion ||
+		dispatchPayload.Dispatch.IssueContext.Format != "prompt" ||
+		dispatchPayload.Dispatch.IssueContext.Provider != issuecore.ProviderLocal ||
+		dispatchPayload.Dispatch.IssueContext.Repository != "bagakit/issues" ||
+		dispatchPayload.Dispatch.IssueContext.IssueID != createPayload.Issue.ID ||
+		dispatchPayload.Dispatch.IssueContext.IssueNumber != 1 {
+		t.Fatalf("dispatch issue context was not normalized: %+v", dispatchPayload.Dispatch.IssueContext)
+	}
+	if dispatchPayload.Issue.Dispatch == nil || dispatchPayload.Issue.Dispatch.Latest.ID != "dispatch-cli-1" {
+		t.Fatalf("dispatch output missing issue metadata: %+v", dispatchPayload.Issue.Dispatch)
+	}
+
+	issueID, err := issuecore.ParseIssueID(createPayload.Issue.ID)
+	if err != nil {
+		t.Fatalf("parse issue id: %v", err)
+	}
+	dispatchPath, err := issuecore.DispatchRecordPath(issueID, 1)
+	if err != nil {
+		t.Fatalf("dispatch path: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(localRoot, filepath.FromSlash(dispatchPath.String()))); err != nil {
+		t.Fatalf("canonical dispatch record was not written: %v", err)
+	}
+
+	viewOut := run("view", "--repository", "bagakit/issues", "--json", "1")
+	var viewPayload struct {
+		Issue struct {
+			Dispatch *struct {
+				Latest struct {
+					ID string `json:"id"`
+				} `json:"latest"`
+			} `json:"dispatch"`
+		} `json:"issue"`
+	}
+	if err := json.Unmarshal(viewOut, &viewPayload); err != nil {
+		t.Fatalf("decode view output: %v", err)
+	}
+	if viewPayload.Issue.Dispatch == nil || viewPayload.Issue.Dispatch.Latest.ID != "dispatch-cli-1" {
+		t.Fatalf("view output missing dispatch metadata: %+v", viewPayload.Issue.Dispatch)
+	}
+
+	contextOut := run("context", "--repository", "bagakit/issues", "--json", "1")
+	var contextPayload struct {
+		Issue struct {
+			Dispatch *struct {
+				Latest struct {
+					ID       string `json:"id"`
+					Terminal struct {
+						Existing struct {
+							RuntimeIdentity string `json:"runtime_identity"`
+						} `json:"existing_terminal"`
+					} `json:"terminal"`
+				} `json:"latest"`
+			} `json:"dispatch"`
+		} `json:"issue"`
+	}
+	if err := json.Unmarshal(contextOut, &contextPayload); err != nil {
+		t.Fatalf("decode context output: %v", err)
+	}
+	if contextPayload.Issue.Dispatch == nil ||
+		contextPayload.Issue.Dispatch.Latest.ID != "dispatch-cli-1" ||
+		contextPayload.Issue.Dispatch.Latest.Terminal.Existing.RuntimeIdentity != "codex/gpt-5" {
+		t.Fatalf("context output missing dispatch metadata: %+v", contextPayload.Issue.Dispatch)
+	}
+
+	promptOut := string(run("context", "--repository", "bagakit/issues", "1"))
+	for _, want := range []string{
+		"Dispatch Records (1):",
+		"runtime=codex/gpt-5",
+		"context=issues.context.v1/prompt",
+	} {
+		if !strings.Contains(promptOut, want) {
+			t.Fatalf("prompt output missing %q:\n%s", want, promptOut)
+		}
 	}
 }
 

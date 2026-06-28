@@ -139,6 +139,7 @@ func TestPlanMutationsBuildExpectedRequests(t *testing.T) {
 					Body:       "body",
 					Labels:     []string{"zeta", "alpha"},
 					Assignees:  []string{"bob", "alice"},
+					Milestone:  "7",
 				})
 			},
 			method: http.MethodPost,
@@ -148,6 +149,7 @@ func TestPlanMutationsBuildExpectedRequests(t *testing.T) {
 				"body":      "body",
 				"labels":    []any{"alpha", "zeta"},
 				"assignees": []any{"alice", "bob"},
+				"milestone": float64(7),
 			},
 			hasBody: true,
 		},
@@ -157,6 +159,7 @@ func TestPlanMutationsBuildExpectedRequests(t *testing.T) {
 				return provider.PlanUpdateIssue(issuecore.IssueLocator{Repository: "bagakit/issues", Number: 9}, issuecore.IssuePatch{
 					Title:     stringPtr("updated title"),
 					Assignees: slicePtr([]string{"bob", "alice"}),
+					Milestone: stringPtr("8"),
 				})
 			},
 			method: http.MethodPatch,
@@ -164,6 +167,7 @@ func TestPlanMutationsBuildExpectedRequests(t *testing.T) {
 			body: map[string]any{
 				"title":     "updated title",
 				"assignees": []any{"alice", "bob"},
+				"milestone": float64(8),
 			},
 			hasBody: true,
 		},
@@ -368,6 +372,91 @@ func TestPlanGetIssueAllowsEnterpriseAPIURLLocatorWithBasePath(t *testing.T) {
 	}
 }
 
+func TestGetIssueDecodesEnterpriseRepositoryURLs(t *testing.T) {
+	t.Parallel()
+
+	doer := &scriptedDoer{
+		t: t,
+		handlers: []doerFunc{
+			func(req *http.Request) (*http.Response, error) {
+				if req.URL.Path != "/api/v3/repos/bagakit/issues/issues/7" {
+					t.Fatalf("unexpected issue path: %q", req.URL.Path)
+				}
+				return jsonResponse(http.StatusOK, nil, `{
+					"id": 700,
+					"node_id": "I_kw700",
+					"repository_url": "https://github.example.com/api/v3/repos/bagakit/issues",
+					"number": 7,
+					"url": "https://github.example.com/api/v3/repos/bagakit/issues/issues/7",
+					"html_url": "https://github.example.com/bagakit/issues/issues/7",
+					"title": "Enterprise issue",
+					"body": "Decode repository from API URL with base path",
+					"state": "open",
+					"comments": 0,
+					"user": {"id": 1, "login": "maintainer", "type": "User"},
+					"created_at": "2024-01-02T00:00:00Z",
+					"updated_at": "2024-01-02T01:00:00Z"
+				}`)
+			},
+			func(req *http.Request) (*http.Response, error) {
+				if req.URL.Path != "/api/v3/repos/bagakit/issues/issues/7/timeline" {
+					t.Fatalf("unexpected timeline path: %q", req.URL.Path)
+				}
+				return jsonResponse(http.StatusOK, nil, `[
+					{
+						"id": 1001,
+						"node_id": "TE_kw1001",
+						"event": "cross-referenced",
+						"actor": {"id": 2, "login": "octocat", "type": "User"},
+						"created_at": "2024-01-02T02:00:00Z",
+						"source": {
+							"type": "issue",
+							"issue": {
+								"id": 1200,
+								"node_id": "PR_kw1200",
+								"repository_url": "https://github.example.com/api/v3/repos/bagakit/issues",
+								"number": 12,
+								"url": "https://github.example.com/api/v3/repos/bagakit/issues/issues/12",
+								"html_url": "https://github.example.com/bagakit/issues/pull/12",
+								"title": "Enterprise PR",
+								"state": "open",
+								"user": {"id": 3, "login": "reviewer", "type": "User"},
+								"created_at": "2024-01-02T01:00:00Z",
+								"updated_at": "2024-01-02T02:00:00Z",
+								"pull_request": {
+									"url": "https://github.example.com/api/v3/repos/bagakit/issues/pulls/12",
+									"html_url": "https://github.example.com/bagakit/issues/pull/12"
+								}
+							}
+						}
+					}
+				]`)
+			},
+		},
+	}
+	provider := newTestProviderWithBaseURL(t, "test-token", "https://github.example.com/api/v3/", doer)
+
+	issue, err := provider.GetIssue(context.Background(), issuecore.IssueLocator{
+		ID: "https://github.example.com/bagakit/issues/issues/7",
+	})
+	if err != nil {
+		t.Fatalf("get enterprise issue: %v", err)
+	}
+	if issue.Repository != "bagakit/issues" {
+		t.Fatalf("unexpected repository: %q", issue.Repository)
+	}
+	if len(issue.LinkedPullRequests) != 1 {
+		t.Fatalf("unexpected linked pull requests: %+v", issue.LinkedPullRequests)
+	}
+	linked := issue.LinkedPullRequests[0]
+	if linked.Repository != "bagakit/issues" || linked.Number != 12 {
+		t.Fatalf("unexpected enterprise linked pull request: %+v", linked)
+	}
+	if doer.calls != len(doer.handlers) {
+		t.Fatalf("unexpected request count: got %d want %d", doer.calls, len(doer.handlers))
+	}
+}
+
 func TestPlanGetIssueRejectsRepositoryMismatchForURLLocator(t *testing.T) {
 	t.Parallel()
 
@@ -424,6 +513,85 @@ func TestPlanGetIssueRejectsNonGitHubURLLocator(t *testing.T) {
 		ID: "https://example.com/bagakit/issues/issues/7",
 	})
 	requireInvalidArgument(t, err)
+}
+
+func TestPlanListIssuesReportsUnsupportedSearchCapability(t *testing.T) {
+	t.Parallel()
+
+	provider := newTestProvider(t, "test-token", nil)
+
+	_, err := provider.PlanListIssues(issuecore.ListIssuesQuery{
+		Repository: "bagakit/issues",
+		Search:     "text",
+	})
+	if err == nil {
+		t.Fatalf("expected unsupported search error")
+	}
+
+	var opErr *issuecore.OperationError
+	if !errors.As(err, &opErr) {
+		t.Fatalf("expected OperationError, got %T", err)
+	}
+	if opErr.Code != "unsupported_capability" || opErr.Provider != issuecore.ProviderGitHub || opErr.Operation != "list" {
+		t.Fatalf("unexpected operation error: %+v", opErr)
+	}
+	var unsupported *issuecore.UnsupportedCapabilityError
+	if !errors.As(err, &unsupported) {
+		t.Fatalf("expected UnsupportedCapabilityError, got %T", err)
+	}
+	if unsupported.Capability.Interface != "github_rest" ||
+		unsupported.Capability.Field != "search" ||
+		unsupported.Capability.Behavior != "repository_issue_text_search" ||
+		unsupported.Capability.CompatibilityLevel != "unsupported" ||
+		unsupported.Capability.SuggestedAlternative == "" {
+		t.Fatalf("unexpected unsupported capability: %+v", unsupported.Capability)
+	}
+}
+
+func TestPlanMutationsReportUnsupportedMilestoneTitleLookup(t *testing.T) {
+	t.Parallel()
+
+	provider := newTestProvider(t, "test-token", nil)
+
+	_, err := provider.PlanCreateIssue(issuecore.CreateIssueInput{
+		Repository: "bagakit/issues",
+		Title:      "ship it",
+		Milestone:  "v1",
+	})
+	if err == nil {
+		t.Fatalf("expected unsupported milestone title error")
+	}
+
+	var unsupported *issuecore.UnsupportedCapabilityError
+	if !errors.As(err, &unsupported) {
+		t.Fatalf("expected UnsupportedCapabilityError, got %T", err)
+	}
+	if unsupported.Capability.Flag != "--milestone" ||
+		unsupported.Capability.Field != "milestone" ||
+		unsupported.Capability.Behavior != "milestone_title_lookup" {
+		t.Fatalf("unexpected unsupported milestone capability: %+v", unsupported.Capability)
+	}
+}
+
+func TestPlanGetIssueReportsUnsupportedNodeIDLookup(t *testing.T) {
+	t.Parallel()
+
+	provider := newTestProvider(t, "test-token", nil)
+
+	_, err := provider.PlanGetIssue(issuecore.IssueLocator{ID: "MDU6SXNzdWUx"})
+	if err == nil {
+		t.Fatalf("expected unsupported node id lookup error")
+	}
+
+	var unsupported *issuecore.UnsupportedCapabilityError
+	if !errors.As(err, &unsupported) {
+		t.Fatalf("expected UnsupportedCapabilityError, got %T", err)
+	}
+	if unsupported.Capability.Field != "id" ||
+		unsupported.Capability.Behavior != "node_id_or_external_id_lookup" ||
+		unsupported.Capability.SuggestedAlternative == "" {
+		t.Fatalf("unexpected unsupported id capability: %+v", unsupported.Capability)
+	}
 }
 
 func TestPlanGetIssueRejectsNonIssueURLLocator(t *testing.T) {

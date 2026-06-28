@@ -239,7 +239,13 @@ func (p *Provider) PlanListIssues(query issuecore.ListIssuesQuery) (RequestPlan,
 		return RequestPlan{}, p.operationError("list", "invalid_argument", err)
 	}
 	if strings.TrimSpace(query.Search) != "" {
-		return RequestPlan{}, p.operationError("list", "invalid_argument", fmt.Errorf("github provider does not support repository issue text search"))
+		return RequestPlan{}, p.unsupportedCapability("list", issuecore.UnsupportedCapability{
+			Interface:            "github_rest",
+			Field:                "search",
+			Behavior:             "repository_issue_text_search",
+			Reason:               "repository issue list does not provide this provider's GitHub-compatible text search behavior",
+			SuggestedAlternative: "omit search and filter returned issues locally, or use a future GitHub search-backed provider path",
+		})
 	}
 	if !validIssueStates[query.State] {
 		return RequestPlan{}, p.operationError("list", "invalid_argument", fmt.Errorf("unsupported issue state filter %q", query.State))
@@ -307,6 +313,13 @@ func (p *Provider) PlanCreateIssue(input issuecore.CreateIssueInput) (RequestPla
 	if assignees := normalizeSet(input.Assignees); len(assignees) > 0 {
 		payload["assignees"] = assignees
 	}
+	if milestone := strings.TrimSpace(input.Milestone); milestone != "" {
+		value, err := parseMilestoneNumber(milestone)
+		if err != nil {
+			return RequestPlan{}, p.unsupportedMilestone("create")
+		}
+		payload["milestone"] = value
+	}
 
 	u := p.endpointURL("repos/" + url.PathEscape(repo.Owner) + "/" + url.PathEscape(repo.Repo) + "/issues")
 	return buildPlan("create", http.MethodPost, u, payload)
@@ -321,7 +334,13 @@ func (p *Provider) PlanUpdateIssue(locator issuecore.IssueLocator, patch issueco
 		return RequestPlan{}, p.operationError("update", "invalid_argument", fmt.Errorf("issue patch requires at least one field"))
 	}
 	if patch.StateReason != nil {
-		return RequestPlan{}, p.operationError("update", "invalid_argument", fmt.Errorf("github provider only accepts state_reason via close or reopen"))
+		return RequestPlan{}, p.unsupportedCapability("update", issuecore.UnsupportedCapability{
+			Interface:            "github_rest",
+			Field:                "state_reason",
+			Behavior:             "direct_state_reason_update",
+			Reason:               "GitHub-compatible state_reason changes must be sent with a close or reopen state transition",
+			SuggestedAlternative: "use issues close --reason <reason> or issues reopen",
+		})
 	}
 
 	payload := map[string]any{}
@@ -340,6 +359,18 @@ func (p *Provider) PlanUpdateIssue(locator issuecore.IssueLocator, patch issueco
 	}
 	if patch.Assignees != nil {
 		payload["assignees"] = normalizeSet(*patch.Assignees)
+	}
+	if patch.Milestone != nil {
+		milestone := strings.TrimSpace(*patch.Milestone)
+		if milestone == "" {
+			payload["milestone"] = nil
+		} else {
+			value, err := parseMilestoneNumber(milestone)
+			if err != nil {
+				return RequestPlan{}, p.unsupportedMilestone("update")
+			}
+			payload["milestone"] = value
+		}
 	}
 
 	u := p.endpointURL("repos/" + url.PathEscape(repo.Owner) + "/" + url.PathEscape(repo.Repo) + "/issues/" + strconv.Itoa(number))
@@ -769,8 +800,17 @@ func (p *Provider) resolveIssue(locator issuecore.IssueLocator, operation string
 		}
 		return urlRepo, number, nil
 	}
+	if u, err := url.Parse(id); err == nil && u.IsAbs() {
+		return repositoryRef{}, 0, p.operationError(operation, "invalid_argument", fmt.Errorf("github provider requires a numeric issue identifier or issue URL"))
+	}
 
-	return repositoryRef{}, 0, p.operationError(operation, "invalid_argument", fmt.Errorf("github provider requires a numeric issue identifier or issue URL"))
+	return repositoryRef{}, 0, p.unsupportedCapability(operation, issuecore.UnsupportedCapability{
+		Interface:            "github_rest",
+		Field:                "id",
+		Behavior:             "node_id_or_external_id_lookup",
+		Reason:               "this GitHub provider resolves numeric issue numbers and issue URLs, but does not resolve GraphQL node IDs or arbitrary external IDs",
+		SuggestedAlternative: "pass --repository owner/repo with a numeric issue number, or pass the issue URL",
+	})
 }
 
 func (p *Provider) operationError(operation, code string, err error) error {
@@ -780,6 +820,21 @@ func (p *Provider) operationError(operation, code string, err error) error {
 		Operation: operation,
 		Err:       err,
 	}
+}
+
+func (p *Provider) unsupportedCapability(operation string, capability issuecore.UnsupportedCapability) error {
+	return issuecore.UnsupportedCapabilityOperation(issuecore.ProviderGitHub, operation, capability)
+}
+
+func (p *Provider) unsupportedMilestone(operation string) error {
+	return p.unsupportedCapability(operation, issuecore.UnsupportedCapability{
+		Interface:            "github_rest",
+		Flag:                 "--milestone",
+		Field:                "milestone",
+		Behavior:             "milestone_title_lookup",
+		Reason:               "this provider can pass numeric GitHub milestone ids but does not resolve milestone titles",
+		SuggestedAlternative: "pass the numeric milestone id, or omit --milestone until title lookup is implemented",
+	})
 }
 
 func buildPlan(operation, method string, u *url.URL, payload any) (RequestPlan, error) {
@@ -1089,6 +1144,21 @@ func parseAPIIssuePath(parts []string) (repositoryRef, int, bool) {
 	return repositoryAndNumberFromParts(parts[1], parts[2], parts[4])
 }
 
+func parseAPIRepositoryPath(parts []string) (repositoryRef, bool) {
+	for idx := 0; idx+2 < len(parts); idx++ {
+		if parts[idx] != "repos" {
+			continue
+		}
+		owner := strings.TrimSpace(parts[idx+1])
+		repo := strings.TrimSpace(parts[idx+2])
+		if owner == "" || repo == "" {
+			return repositoryRef{}, false
+		}
+		return repositoryRef{Owner: owner, Repo: repo}, true
+	}
+	return repositoryRef{}, false
+}
+
 func parseHTMLIssuePath(parts []string) (repositoryRef, int, bool) {
 	if len(parts) != 4 || (parts[2] != "issues" && parts[2] != "pull") {
 		return repositoryRef{}, 0, false
@@ -1113,11 +1183,11 @@ func repositoryFromAPIURL(raw string) string {
 	if err != nil {
 		return ""
 	}
-	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
-	if len(parts) >= 3 && parts[0] == "repos" {
-		return parts[1] + "/" + parts[2]
+	repo, ok := parseAPIRepositoryPath(pathSegments(u.Path))
+	if !ok {
+		return ""
 	}
-	return ""
+	return repo.String()
 }
 
 func emptyPatch(patch issuecore.IssuePatch) bool {
@@ -1125,7 +1195,16 @@ func emptyPatch(patch issuecore.IssuePatch) bool {
 		patch.Body == nil &&
 		patch.Labels == nil &&
 		patch.Assignees == nil &&
+		patch.Milestone == nil &&
 		patch.StateReason == nil
+}
+
+func parseMilestoneNumber(raw string) (int, error) {
+	value, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil || value <= 0 {
+		return 0, fmt.Errorf("github milestone must be a positive milestone number")
+	}
+	return value, nil
 }
 
 func normalizeSet(values []string) []string {

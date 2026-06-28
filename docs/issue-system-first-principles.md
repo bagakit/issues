@@ -44,9 +44,10 @@ GitHub-backed issues, agent context packets, Karp dispatch, and future adapters.
    service modes.
 
 4. Local durability comes before remote ambition.
-   SQLite should be the authoritative local store. Append-only event or outbox
-   records should preserve operation history and make tests, export, provider
-   bridges, and failure recovery deterministic.
+   Storage-neutral logical files are the authoritative local issue truth.
+   SQLite or another database may cache, index, import, or migrate data, but it
+   must be rebuildable from canonical logical files and must not become a
+   second authority.
 
 5. Daemon mode must be transparent.
    Users and agents should see the same commands and JSON whether operations
@@ -68,7 +69,8 @@ GitHub-backed issues, agent context packets, Karp dispatch, and future adapters.
 - Define GitHub-shaped issue, comment, label, reaction, timeline/event, and PR
   link structures without turning them into Karp-specific task blobs.
 - Provide provider interfaces for local and GitHub-backed issues.
-- Implement local CRUD and state changes over durable SQLite storage.
+- Implement local CRUD and state changes over the durable logical file protocol
+  with the local filesystem backend as the default local provider.
 - Preserve deterministic export or fixture output for tests and provider
   bridges.
 - Expose `issues` commands for create, list, view, update, comment, close,
@@ -96,7 +98,7 @@ GitHub-backed issues, agent context packets, Karp dispatch, and future adapters.
 
 1. Scaffold the Go module, domain model, service boundary, provider interfaces,
    and command contract.
-2. Implement durable local storage and local issue operations.
+2. Implement durable logical file storage and local issue operations.
 3. Expose the standalone `issues` CLI and stable JSON output.
 4. Add prompt-friendly context rendering.
 5. Define Karp dispatch and client contracts.

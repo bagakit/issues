@@ -51,6 +51,7 @@ type CreateIssueInput struct {
 	Body       string   `json:"body,omitempty"`
 	Labels     []string `json:"labels,omitempty"`
 	Assignees  []string `json:"assignees,omitempty"`
+	Milestone  string   `json:"milestone,omitempty"`
 }
 
 type ListIssuesQuery struct {
@@ -73,6 +74,7 @@ type IssuePatch struct {
 	Body        *string           `json:"body,omitempty"`
 	Labels      *[]string         `json:"labels,omitempty"`
 	Assignees   *[]string         `json:"assignees,omitempty"`
+	Milestone   *string           `json:"milestone,omitempty"`
 	StateReason *IssueStateReason `json:"state_reason,omitempty"`
 }
 

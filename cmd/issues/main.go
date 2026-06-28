@@ -5,17 +5,17 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/bagakit/issues/internal/cli"
+	"github.com/bagakit/issues/internal/app"
 )
 
 var version = "dev"
 
 func main() {
-	app, err := cli.New(version)
+	application, err := app.New(version)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "issues: %v\n", err)
 		os.Exit(1)
 	}
 
-	os.Exit(app.Run(context.Background(), os.Args[1:]))
+	os.Exit(application.Run(context.Background(), os.Args[1:]))
 }

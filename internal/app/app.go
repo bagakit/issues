@@ -1,4 +1,4 @@
-package cli
+package app
 
 import (
 	"context"
@@ -10,14 +10,18 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	githubprovider "github.com/bagakit/issues/internal/providers/github"
 	"github.com/bagakit/issues/internal/providers/local"
+	"github.com/bagakit/issues/internal/providers/localfile"
 	"github.com/bagakit/issues/pkg/issuecore"
 )
 
 const (
 	modulePath           = "github.com/bagakit/issues"
+	localStoreEnv        = localfile.EnvStorePath
+	localStoreCompatEnv  = localfile.EnvStorePathCompat
 	localDatabaseEnv     = local.EnvDBPath
 	githubTokenEnv       = githubprovider.EnvToken
 	githubTokenGHEnv     = githubprovider.EnvTokenGH
@@ -26,9 +30,9 @@ const (
 )
 
 type serviceConfig struct {
-	LocalDBPath   string
-	GitHubToken   string
-	GitHubBaseURL string
+	LocalStorePath string
+	GitHubToken    string
+	GitHubBaseURL  string
 }
 
 type App struct {
@@ -43,7 +47,7 @@ func New(version string) (*App, error) {
 	return &App{
 		Version: version,
 		ServiceFactory: func(cfg serviceConfig) (*issuecore.Service, func(), error) {
-			localProvider, err := local.New(local.Config{Path: cfg.LocalDBPath})
+			localProvider, err := localfile.New(localfile.Config{Path: cfg.LocalStorePath})
 			if err != nil {
 				return nil, nil, err
 			}
@@ -116,8 +120,12 @@ func (a *App) Run(ctx context.Context, args []string) int {
 		return a.runCreate(ctx, args[1:])
 	case "edit":
 		return a.runEdit(ctx, args[1:])
+	case "update":
+		return a.runEdit(ctx, args[1:])
 	case "context":
 		return a.runContext(ctx, args[1:])
+	case "record-dispatch":
+		return a.runRecordDispatch(ctx, args[1:])
 	case "comment":
 		return a.runComment(ctx, args[1:])
 	case "close":
@@ -280,6 +288,7 @@ func (a *App) runCreate(ctx context.Context, args []string) int {
 	body := flags.String("body", "", "issue body")
 	labels := flags.String("labels", "", "comma-separated labels")
 	assignees := flags.String("assignees", "", "comma-separated assignee logins")
+	milestone := flags.String("milestone", "", "milestone title or number")
 	jsonOut := flags.Bool("json", false, "render JSON")
 	if err := flags.Parse(args); err != nil {
 		return 2
@@ -295,6 +304,7 @@ func (a *App) runCreate(ctx context.Context, args []string) int {
 		Body:       *body,
 		Labels:     splitCSV(*labels),
 		Assignees:  splitCSV(*assignees),
+		Milestone:  *milestone,
 	})
 	if err != nil {
 		return a.renderError(*jsonOut, err)
@@ -324,6 +334,7 @@ func (a *App) runEdit(ctx context.Context, args []string) int {
 	body := flags.String("body", "", "issue body")
 	labels := flags.String("labels", "", "comma-separated labels")
 	assignees := flags.String("assignees", "", "comma-separated assignee logins")
+	milestone := flags.String("milestone", "", "milestone title or number")
 	jsonOut := flags.Bool("json", false, "render JSON")
 	if err := flags.Parse(args); err != nil {
 		return 2
@@ -351,8 +362,12 @@ func (a *App) runEdit(ctx context.Context, args []string) int {
 		assigneesValue := splitCSV(*assignees)
 		patch.Assignees = &assigneesValue
 	}
+	if visited["milestone"] {
+		milestoneValue := *milestone
+		patch.Milestone = &milestoneValue
+	}
 
-	if patch.Title == nil && patch.Body == nil && patch.Labels == nil && patch.Assignees == nil && patch.StateReason == nil {
+	if patch.Title == nil && patch.Body == nil && patch.Labels == nil && patch.Assignees == nil && patch.Milestone == nil && patch.StateReason == nil {
 		return a.renderError(*jsonOut, fmt.Errorf("edit requires at least one field change"))
 	}
 
@@ -414,6 +429,110 @@ func (a *App) runContext(ctx context.Context, args []string) int {
 		return a.renderError(false, err)
 	}
 	fmt.Fprint(a.Stdout, prompt)
+	return 0
+}
+
+func (a *App) runRecordDispatch(ctx context.Context, args []string) int {
+	flags := a.newFlagSet("record-dispatch")
+	provider := flags.String("provider", issuecore.ProviderLocal, "provider name")
+	repository := flags.String("repository", "", "repository owner/name")
+	dispatchID := flags.String("dispatch-id", "", "dispatch record id")
+	targetGroupID := flags.String("target-group", "", "dispatch target group id")
+	targetGroupName := flags.String("target-group-name", "", "dispatch target group name")
+	terminalMode := flags.String("terminal-mode", "", "reuse_existing|create_new")
+	terminalID := flags.String("terminal-id", "", "existing terminal id")
+	terminalTitle := flags.String("terminal-title", "", "terminal title")
+	runtimeIdentity := flags.String("runtime-identity", "", "existing terminal runtime identity")
+	agent := flags.String("agent", "", "new terminal agent")
+	runtime := flags.String("runtime", "", "new terminal runtime")
+	profile := flags.String("profile", "", "new terminal runtime profile")
+	runtimeMetadata := flags.String("runtime-metadata", "", "comma-separated runtime metadata key=value pairs")
+	outcome := flags.String("outcome", string(issuecore.DispatchOutcomeDelivered), "pending|delivered|failed|cancelled")
+	dispatchedAt := flags.String("dispatched-at", "", "dispatch timestamp in RFC3339 format")
+	contextFormat := flags.String("context-format", string(issuecore.ContextFormatJSON), "json|prompt")
+	jsonOut := flags.Bool("json", false, "render JSON")
+	if err := flags.Parse(args); err != nil {
+		return 2
+	}
+
+	if flags.NArg() != 1 {
+		return a.renderError(*jsonOut, fmt.Errorf("record-dispatch requires exactly one issue identifier"))
+	}
+	if strings.TrimSpace(*targetGroupID) == "" {
+		return a.renderError(*jsonOut, fmt.Errorf("record-dispatch requires --target-group"))
+	}
+
+	recordTime, err := parseDispatchTime(*dispatchedAt)
+	if err != nil {
+		return a.renderError(*jsonOut, err)
+	}
+	parsedOutcome, err := parseDispatchOutcome(*outcome)
+	if err != nil {
+		return a.renderError(*jsonOut, err)
+	}
+	parsedContextFormat, err := parseContextFormat(*contextFormat)
+	if err != nil {
+		return a.renderError(*jsonOut, err)
+	}
+	metadata, err := parseKeyValueCSV(*runtimeMetadata)
+	if err != nil {
+		return a.renderError(*jsonOut, err)
+	}
+	terminal, err := buildDispatchTerminal(dispatchTerminalInput{
+		Mode:            *terminalMode,
+		TerminalID:      *terminalID,
+		TerminalTitle:   *terminalTitle,
+		RuntimeIdentity: *runtimeIdentity,
+		Agent:           *agent,
+		Runtime:         *runtime,
+		Profile:         *profile,
+		RuntimeMetadata: metadata,
+	})
+	if err != nil {
+		return a.renderError(*jsonOut, err)
+	}
+
+	issue, err := a.Service.RecordDispatch(ctx, *provider, parseLocator(*repository, flags.Arg(0)), issuecore.DispatchRecord{
+		ID: strings.TrimSpace(*dispatchID),
+		TargetGroup: issuecore.DispatchTargetGroup{
+			ID:   strings.TrimSpace(*targetGroupID),
+			Name: strings.TrimSpace(*targetGroupName),
+		},
+		Terminal:     terminal,
+		DispatchedAt: recordTime,
+		Outcome:      parsedOutcome,
+		IssueContext: issuecore.IssueContextLink{
+			SchemaVersion: issuecore.ContextSchemaVersion,
+			Format:        parsedContextFormat,
+		},
+	})
+	if err != nil {
+		return a.renderError(*jsonOut, err)
+	}
+
+	if issue.Dispatch == nil || issue.Dispatch.Latest == nil {
+		return a.renderError(*jsonOut, fmt.Errorf("record-dispatch provider did not return persisted dispatch metadata"))
+	}
+	recorded := *issue.Dispatch.Latest
+	payload := struct {
+		Provider string                   `json:"provider"`
+		Dispatch issuecore.DispatchRecord `json:"dispatch"`
+		Issue    issuecore.Issue          `json:"issue"`
+	}{
+		Provider: *provider,
+		Dispatch: recorded,
+		Issue:    issue,
+	}
+
+	if *jsonOut {
+		return a.writeJSON(a.Stdout, payload)
+	}
+
+	if recorded.ID != "" {
+		fmt.Fprintf(a.Stdout, "recorded dispatch %s for %s#%d\n", recorded.ID, issue.Repository, issue.Number)
+		return 0
+	}
+	fmt.Fprintf(a.Stdout, "recorded dispatch for %s#%d\n", issue.Repository, issue.Number)
 	return 0
 }
 
@@ -532,6 +651,11 @@ func (a *App) renderError(jsonOut bool, err error) int {
 		payload.Provider = opErr.Provider
 		payload.Operation = opErr.Operation
 	}
+	var unsupported *issuecore.UnsupportedCapabilityError
+	if errors.As(err, &unsupported) {
+		capability := unsupported.Capability
+		payload.UnsupportedCapability = &capability
+	}
 
 	if jsonOut {
 		if a.writeJSON(a.Stdout, struct {
@@ -562,8 +686,12 @@ func (a *App) writeUsage(w io.Writer) {
 	fmt.Fprint(w, `issues <command> [flags]
 
 Global Flags:
-  --db <path>         local SQLite database path
-  `+localDatabaseEnv+`  local SQLite database path environment variable
+  --local-root <path> local logical file store root
+  --store <path>      alias for --local-root
+  `+localStoreEnv+`   local logical file store root environment variable
+  `+localStoreCompatEnv+`   compatibility alias for `+localStoreEnv+`
+  --db <path>         deprecated alias for --store
+  `+localDatabaseEnv+`  deprecated alias for `+localStoreEnv+`
   --github-token <token>     GitHub provider token
   --github-base-url <url>    GitHub REST API base URL
   `+githubTokenEnv+` / `+githubTokenGHEnv+` / `+githubTokenCompatEnv+`  GitHub provider token environments
@@ -576,7 +704,9 @@ Commands:
   view <issue>
   create --title <title>
   edit <issue>
+  update <issue>
   context <issue>
+  record-dispatch <issue>
   comment <issue> --body <text>
   close <issue>
   reopen <issue>
@@ -591,10 +721,11 @@ func (a *App) version() string {
 }
 
 type cliError struct {
-	Code      string `json:"code"`
-	Message   string `json:"message"`
-	Provider  string `json:"provider,omitempty"`
-	Operation string `json:"operation,omitempty"`
+	Code                  string                           `json:"code"`
+	Message               string                           `json:"message"`
+	Provider              string                           `json:"provider,omitempty"`
+	Operation             string                           `json:"operation,omitempty"`
+	UnsupportedCapability *issuecore.UnsupportedCapability `json:"unsupported_capability,omitempty"`
 }
 
 func capabilities(set issuecore.CapabilitySet) []string {
@@ -656,15 +787,137 @@ func parseLocator(repository, value string) issuecore.IssueLocator {
 	return locator
 }
 
+type dispatchTerminalInput struct {
+	Mode            string
+	TerminalID      string
+	TerminalTitle   string
+	RuntimeIdentity string
+	Agent           string
+	Runtime         string
+	Profile         string
+	RuntimeMetadata map[string]string
+}
+
+func buildDispatchTerminal(input dispatchTerminalInput) (issuecore.DispatchTerminal, error) {
+	switch issuecore.DispatchTerminalMode(strings.TrimSpace(input.Mode)) {
+	case issuecore.DispatchTerminalModeReuseExisting:
+		if strings.TrimSpace(input.TerminalID) == "" {
+			return issuecore.DispatchTerminal{}, fmt.Errorf("record-dispatch reuse_existing requires --terminal-id")
+		}
+		if strings.TrimSpace(input.RuntimeIdentity) == "" {
+			return issuecore.DispatchTerminal{}, fmt.Errorf("record-dispatch reuse_existing requires --runtime-identity")
+		}
+		return issuecore.DispatchTerminal{
+			Mode: issuecore.DispatchTerminalModeReuseExisting,
+			Existing: &issuecore.ExistingTerminal{
+				ID:               strings.TrimSpace(input.TerminalID),
+				Title:            strings.TrimSpace(input.TerminalTitle),
+				RuntimePreserved: true,
+				RuntimeIdentity:  strings.TrimSpace(input.RuntimeIdentity),
+			},
+		}, nil
+	case issuecore.DispatchTerminalModeCreateNew:
+		if strings.TrimSpace(input.Agent) == "" &&
+			strings.TrimSpace(input.Runtime) == "" &&
+			strings.TrimSpace(input.Profile) == "" &&
+			len(input.RuntimeMetadata) == 0 {
+			return issuecore.DispatchTerminal{}, fmt.Errorf("record-dispatch create_new requires --agent, --runtime, --profile, or --runtime-metadata")
+		}
+		return issuecore.DispatchTerminal{
+			Mode: issuecore.DispatchTerminalModeCreateNew,
+			New: &issuecore.NewTerminal{
+				Title: strings.TrimSpace(input.TerminalTitle),
+				Runtime: &issuecore.RuntimeSelection{
+					Agent:    strings.TrimSpace(input.Agent),
+					Runtime:  strings.TrimSpace(input.Runtime),
+					Profile:  strings.TrimSpace(input.Profile),
+					Metadata: input.RuntimeMetadata,
+				},
+			},
+		}, nil
+	case "":
+		return issuecore.DispatchTerminal{}, fmt.Errorf("record-dispatch requires --terminal-mode")
+	default:
+		return issuecore.DispatchTerminal{}, fmt.Errorf("unknown dispatch terminal mode %q", input.Mode)
+	}
+}
+
+func parseDispatchTime(value string) (time.Time, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return time.Now().UTC(), nil
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("invalid --dispatched-at: %w", err)
+	}
+	return parsed.UTC(), nil
+}
+
+func parseDispatchOutcome(value string) (issuecore.DispatchOutcome, error) {
+	outcome := issuecore.DispatchOutcome(strings.TrimSpace(value))
+	switch outcome {
+	case issuecore.DispatchOutcomePending, issuecore.DispatchOutcomeDelivered, issuecore.DispatchOutcomeFailed, issuecore.DispatchOutcomeCancelled:
+		return outcome, nil
+	case "":
+		return "", fmt.Errorf("record-dispatch requires --outcome")
+	default:
+		return "", fmt.Errorf("unknown dispatch outcome %q", value)
+	}
+}
+
+func parseContextFormat(value string) (issuecore.ContextFormat, error) {
+	format := issuecore.ContextFormat(strings.TrimSpace(value))
+	switch format {
+	case issuecore.ContextFormatJSON, issuecore.ContextFormatPrompt:
+		return format, nil
+	case "":
+		return issuecore.ContextFormatJSON, nil
+	default:
+		return "", fmt.Errorf("unknown context format %q", value)
+	}
+}
+
+func parseKeyValueCSV(value string) (map[string]string, error) {
+	if strings.TrimSpace(value) == "" {
+		return nil, nil
+	}
+
+	out := map[string]string{}
+	for _, part := range strings.Split(value, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		key, val, ok := strings.Cut(part, "=")
+		if !ok {
+			return nil, fmt.Errorf("runtime metadata %q must be key=value", part)
+		}
+		key = strings.TrimSpace(key)
+		if key == "" {
+			return nil, fmt.Errorf("runtime metadata key is required")
+		}
+		out[key] = strings.TrimSpace(val)
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return out, nil
+}
+
 type globalOptions struct {
-	LocalDBPath   string
-	GitHubToken   string
-	GitHubBaseURL string
+	LocalStorePath string
+	GitHubToken    string
+	GitHubBaseURL  string
 }
 
 func parseGlobalArgs(args []string) (globalOptions, []string, error) {
 	options := globalOptions{
-		LocalDBPath: strings.TrimSpace(os.Getenv(localDatabaseEnv)),
+		LocalStorePath: firstNonEmpty(
+			os.Getenv(localStoreEnv),
+			os.Getenv(localStoreCompatEnv),
+			os.Getenv(localDatabaseEnv),
+		),
 		GitHubToken: firstNonEmpty(
 			os.Getenv(githubTokenEnv),
 			os.Getenv(githubTokenGHEnv),
@@ -677,17 +930,32 @@ func parseGlobalArgs(args []string) (globalOptions, []string, error) {
 	for index < len(args) {
 		arg := args[index]
 		switch {
+		case arg == "--local-root" || arg == "--store" || arg == "--local-store":
+			if index+1 >= len(args) {
+				return globalOptions{}, nil, fmt.Errorf("%s requires a value", arg)
+			}
+			options.LocalStorePath = args[index+1]
+			index += 2
+		case strings.HasPrefix(arg, "--local-root="):
+			options.LocalStorePath = strings.TrimPrefix(arg, "--local-root=")
+			index++
+		case strings.HasPrefix(arg, "--store="):
+			options.LocalStorePath = strings.TrimPrefix(arg, "--store=")
+			index++
+		case strings.HasPrefix(arg, "--local-store="):
+			options.LocalStorePath = strings.TrimPrefix(arg, "--local-store=")
+			index++
 		case arg == "--db" || arg == "--local-db":
 			if index+1 >= len(args) {
 				return globalOptions{}, nil, fmt.Errorf("%s requires a value", arg)
 			}
-			options.LocalDBPath = args[index+1]
+			options.LocalStorePath = args[index+1]
 			index += 2
 		case strings.HasPrefix(arg, "--db="):
-			options.LocalDBPath = strings.TrimPrefix(arg, "--db=")
+			options.LocalStorePath = strings.TrimPrefix(arg, "--db=")
 			index++
 		case strings.HasPrefix(arg, "--local-db="):
-			options.LocalDBPath = strings.TrimPrefix(arg, "--local-db=")
+			options.LocalStorePath = strings.TrimPrefix(arg, "--local-db=")
 			index++
 		case arg == "--github-token":
 			if index+1 >= len(args) {
@@ -743,8 +1011,8 @@ func (a *App) resolveService(options globalOptions) (*issuecore.Service, func(),
 		return nil, nil, errors.New("service factory is not configured")
 	}
 	return a.ServiceFactory(serviceConfig{
-		LocalDBPath:   options.LocalDBPath,
-		GitHubToken:   options.GitHubToken,
-		GitHubBaseURL: options.GitHubBaseURL,
+		LocalStorePath: options.LocalStorePath,
+		GitHubToken:    options.GitHubToken,
+		GitHubBaseURL:  options.GitHubBaseURL,
 	})
 }

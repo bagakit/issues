@@ -172,8 +172,8 @@ func (r DispatchRecord) Validate() error {
 	if r.DispatchedAt.IsZero() {
 		return fmt.Errorf("dispatched_at is required")
 	}
-	if strings.TrimSpace(string(r.Outcome)) == "" {
-		return fmt.Errorf("outcome is required")
+	if err := validateDispatchOutcome(r.Outcome); err != nil {
+		return fmt.Errorf("outcome: %w", err)
 	}
 	if err := r.IssueContext.Validate(); err != nil {
 		return fmt.Errorf("issue_context: %w", err)
@@ -221,4 +221,15 @@ func isZeroIssueContextLink(link IssueContextLink) bool {
 		link.IssueID == "" &&
 		link.IssueNumber == 0 &&
 		link.HTMLURL == ""
+}
+
+func validateDispatchOutcome(outcome DispatchOutcome) error {
+	switch outcome {
+	case DispatchOutcomePending, DispatchOutcomeDelivered, DispatchOutcomeFailed, DispatchOutcomeCancelled:
+		return nil
+	case "":
+		return fmt.Errorf("outcome is required")
+	default:
+		return fmt.Errorf("unsupported dispatch outcome %q", outcome)
+	}
 }

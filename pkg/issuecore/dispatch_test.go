@@ -93,3 +93,37 @@ func TestDispatchRecordValidateRejectsReuseWithoutRuntimePreservation(t *testing
 		t.Fatalf("unexpected validation error: %v", err)
 	}
 }
+
+func TestDispatchRecordValidateRejectsUnknownOutcome(t *testing.T) {
+	t.Parallel()
+
+	record := DispatchRecord{
+		TargetGroup: DispatchTargetGroup{ID: "grp-3"},
+		Terminal: DispatchTerminal{
+			Mode: DispatchTerminalModeCreateNew,
+			New: &NewTerminal{
+				Title: "Worker",
+				Runtime: &RuntimeSelection{
+					Agent:   "codex",
+					Runtime: "gpt-5",
+				},
+			},
+		},
+		DispatchedAt: time.Date(2024, time.January, 2, 6, 0, 0, 0, time.UTC),
+		Outcome:      DispatchOutcome("mystery"),
+		IssueContext: IssueContextLink{
+			SchemaVersion: ContextSchemaVersion,
+			Format:        ContextFormatJSON,
+			Provider:      ProviderLocal,
+			IssueNumber:   3,
+		},
+	}
+
+	err := record.Validate()
+	if err == nil {
+		t.Fatalf("expected validation error")
+	}
+	if !strings.Contains(err.Error(), "unsupported dispatch outcome") {
+		t.Fatalf("unexpected validation error: %v", err)
+	}
+}
