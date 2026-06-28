@@ -7,6 +7,7 @@ import (
 	"errors"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -151,7 +152,7 @@ func TestProviderCRUDAndDeterministicExport(t *testing.T) {
 	if err := json.Unmarshal(exportOne, &snapshot); err != nil {
 		t.Fatalf("decode export: %v", err)
 	}
-	if snapshot.SchemaVersion != 1 || snapshot.Provider != issuecore.ProviderLocal {
+	if snapshot.SchemaVersion != schemaVersion() || snapshot.Provider != issuecore.ProviderLocal {
 		t.Fatalf("unexpected snapshot header: %+v", snapshot)
 	}
 	if got := []int{snapshot.Issues[0].Number, snapshot.Issues[1].Number}; !reflect.DeepEqual(got, []int{1, 2}) {
@@ -236,6 +237,164 @@ func TestProviderUpdateIssueRejectsEmptyPatchWithoutWrites(t *testing.T) {
 	}
 }
 
+func TestProviderRecordDispatchPersistsAcrossGetListAndExport(t *testing.T) {
+	t.Parallel()
+
+	provider := newTestProvider(t)
+	ctx := context.Background()
+
+	created, err := provider.CreateIssue(ctx, issuecore.CreateIssueInput{
+		Repository: "bagakit/issues",
+		Title:      "dispatch me",
+	})
+	if err != nil {
+		t.Fatalf("create issue: %v", err)
+	}
+
+	record := issuecore.DispatchRecord{
+		ID:          "dispatch-1",
+		TargetGroup: issuecore.DispatchTargetGroup{ID: "grp-1", Name: "Spec"},
+		Terminal: issuecore.DispatchTerminal{
+			Mode: issuecore.DispatchTerminalModeReuseExisting,
+			Existing: &issuecore.ExistingTerminal{
+				ID:               "term-7",
+				Title:            "Worker 7",
+				RuntimePreserved: true,
+				RuntimeIdentity:  "codex/gpt-5",
+			},
+		},
+		DispatchedAt: time.Date(2024, time.January, 2, 2, 0, 0, 0, time.UTC),
+		Outcome:      issuecore.DispatchOutcomeDelivered,
+		IssueContext: issuecore.NewIssueContextLink(created, issuecore.ContextFormatPrompt),
+	}
+
+	updated, err := provider.RecordDispatch(ctx, issuecore.IssueLocator{Number: created.Number, Repository: created.Repository}, record)
+	if err != nil {
+		t.Fatalf("record dispatch: %v", err)
+	}
+	if updated.Dispatch == nil || updated.Dispatch.Latest == nil {
+		t.Fatalf("updated issue missing dispatch metadata: %+v", updated.Dispatch)
+	}
+
+	got, err := provider.GetIssue(ctx, issuecore.IssueLocator{Number: created.Number, Repository: created.Repository})
+	if err != nil {
+		t.Fatalf("get issue: %v", err)
+	}
+	if got.Dispatch == nil || got.Dispatch.Latest == nil || got.Dispatch.Latest.ID != "dispatch-1" {
+		t.Fatalf("get issue missing persisted dispatch: %+v", got.Dispatch)
+	}
+
+	page, err := provider.ListIssues(ctx, issuecore.ListIssuesQuery{
+		Repository: created.Repository,
+		State:      issuecore.IssueStateFilterAll,
+	})
+	if err != nil {
+		t.Fatalf("list issues: %v", err)
+	}
+	if len(page.Issues) != 1 || page.Issues[0].Dispatch == nil || page.Issues[0].Dispatch.Latest == nil {
+		t.Fatalf("list issues missing dispatch metadata: %+v", page.Issues)
+	}
+
+	export, err := provider.Export(ctx)
+	if err != nil {
+		t.Fatalf("export: %v", err)
+	}
+	if len(export.Issues) != 1 || export.Issues[0].Dispatch == nil || export.Issues[0].Dispatch.Latest == nil {
+		t.Fatalf("export missing dispatch metadata: %+v", export.Issues)
+	}
+}
+
+func TestProviderRenderContextIncludesPersistedDispatchMetadata(t *testing.T) {
+	t.Parallel()
+
+	provider := newTestProvider(t)
+	ctx := context.Background()
+
+	created, err := provider.CreateIssue(ctx, issuecore.CreateIssueInput{
+		Repository: "bagakit/issues",
+		Title:      "dispatch context",
+		Body:       "Context should show dispatch metadata.",
+	})
+	if err != nil {
+		t.Fatalf("create issue: %v", err)
+	}
+
+	record := issuecore.DispatchRecord{
+		ID:          "dispatch-2",
+		TargetGroup: issuecore.DispatchTargetGroup{ID: "grp-2", Name: "Build"},
+		Terminal: issuecore.DispatchTerminal{
+			Mode: issuecore.DispatchTerminalModeCreateNew,
+			New: &issuecore.NewTerminal{
+				Title: "Build Terminal",
+				Runtime: &issuecore.RuntimeSelection{
+					Agent:   "codex",
+					Runtime: "gpt-5",
+				},
+			},
+		},
+		DispatchedAt: time.Date(2024, time.January, 2, 2, 30, 0, 0, time.UTC),
+		Outcome:      issuecore.DispatchOutcomeDelivered,
+		IssueContext: issuecore.NewIssueContextLink(created, issuecore.ContextFormatJSON),
+	}
+
+	if _, err := provider.RecordDispatch(ctx, issuecore.IssueLocator{Number: created.Number, Repository: created.Repository}, record); err != nil {
+		t.Fatalf("record dispatch: %v", err)
+	}
+
+	got, err := provider.GetIssue(ctx, issuecore.IssueLocator{Number: created.Number, Repository: created.Repository})
+	if err != nil {
+		t.Fatalf("get issue: %v", err)
+	}
+
+	rendered := issuecore.RenderIssueContext(got, issuecore.DefaultContextOptions())
+	if rendered.Issue.Dispatch == nil || rendered.Issue.Dispatch.Latest == nil {
+		t.Fatalf("rendered context missing dispatch metadata: %+v", rendered.Issue.Dispatch)
+	}
+	if err := rendered.Issue.Dispatch.Validate(); err != nil {
+		t.Fatalf("rendered dispatch metadata should validate: %v", err)
+	}
+}
+
+func TestProviderStateReasonValidationRejectsInvalidUpdateCloseAndReopenReasons(t *testing.T) {
+	t.Parallel()
+
+	provider := newTestProvider(t)
+	ctx := context.Background()
+
+	created, err := provider.CreateIssue(ctx, issuecore.CreateIssueInput{
+		Repository: "bagakit/issues",
+		Title:      "state reasons",
+	})
+	if err != nil {
+		t.Fatalf("create issue: %v", err)
+	}
+
+	updateReason := issuecore.IssueStateReasonCompleted
+	_, err = provider.UpdateIssue(ctx, issuecore.IssueLocator{Number: created.Number, Repository: created.Repository}, issuecore.IssuePatch{
+		StateReason: &updateReason,
+	})
+	if err == nil {
+		t.Fatalf("expected update state_reason error")
+	}
+	assertLocalInvalidArgument(t, err, "update", "only accepts state_reason via close or reopen")
+
+	_, err = provider.CloseIssue(ctx, issuecore.IssueLocator{Number: created.Number, Repository: created.Repository}, issuecore.CloseIssueInput{
+		Reason: issuecore.IssueStateReasonReopened,
+	})
+	if err == nil {
+		t.Fatalf("expected close reason error")
+	}
+	assertLocalInvalidArgument(t, err, "close", "unsupported close reason")
+
+	_, err = provider.ReopenIssue(ctx, issuecore.IssueLocator{Number: created.Number, Repository: created.Repository}, issuecore.ReopenIssueInput{
+		Reason: issuecore.IssueStateReasonCompleted,
+	})
+	if err == nil {
+		t.Fatalf("expected reopen reason error")
+	}
+	assertLocalInvalidArgument(t, err, "reopen", "unsupported reopen reason")
+}
+
 func newTestProvider(t *testing.T) *Provider {
 	t.Helper()
 
@@ -304,4 +463,25 @@ func eventKinds(events []EventRecord) []string {
 		kinds = append(kinds, event.Kind)
 	}
 	return kinds
+}
+
+func assertLocalInvalidArgument(t *testing.T, err error, operation, contains string) {
+	t.Helper()
+
+	var opErr *issuecore.OperationError
+	if !errors.As(err, &opErr) {
+		t.Fatalf("expected OperationError, got %T", err)
+	}
+	if opErr.Code != "invalid_argument" {
+		t.Fatalf("unexpected error code: %q", opErr.Code)
+	}
+	if opErr.Provider != issuecore.ProviderLocal {
+		t.Fatalf("unexpected provider: %q", opErr.Provider)
+	}
+	if opErr.Operation != operation {
+		t.Fatalf("unexpected operation: %q", opErr.Operation)
+	}
+	if !strings.Contains(opErr.Error(), contains) {
+		t.Fatalf("unexpected error: %v", opErr)
+	}
 }

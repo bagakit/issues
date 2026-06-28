@@ -1,6 +1,7 @@
 package issuecore
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"time"
@@ -30,8 +31,9 @@ const (
 )
 
 type DispatchTargetGroup struct {
-	ID   string `json:"id"`
-	Name string `json:"name,omitempty"`
+	ID        string             `json:"id"`
+	Name      string             `json:"name,omitempty"`
+	Terminals []ExistingTerminal `json:"terminals,omitempty"`
 }
 
 type ExistingTerminal struct {
@@ -92,6 +94,15 @@ type DispatchRequest struct {
 
 type DispatchResult struct {
 	Record DispatchRecord `json:"record"`
+}
+
+type DispatchGateway interface {
+	ListDispatchTargets(ctx context.Context, issue Issue) ([]DispatchTargetGroup, error)
+	SubmitDispatch(ctx context.Context, issue Issue, request DispatchRequest) (DispatchResult, error)
+}
+
+type DispatchRecorder interface {
+	RecordDispatch(ctx context.Context, locator IssueLocator, record DispatchRecord) (Issue, error)
 }
 
 func NewIssueContextLink(issue Issue, format ContextFormat) IssueContextLink {

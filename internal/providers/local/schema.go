@@ -69,6 +69,7 @@ type issueRecord struct {
 	ClosedByType      string
 	ClosedByURL       string
 	ClosedByHTMLURL   string
+	DispatchJSON      string
 	ProviderRawJSON   string
 }
 
@@ -213,6 +214,12 @@ var migrations = []migration{
 			)`,
 			`CREATE INDEX IF NOT EXISTS issue_events_issue_sequence_idx
 				ON issue_events(issue_id, event_sequence)`,
+		},
+	},
+	{
+		Version: 2,
+		Statements: []string{
+			`ALTER TABLE issues ADD COLUMN dispatch_json TEXT`,
 		},
 	},
 }
@@ -381,20 +388,6 @@ func defaultActor() *issuecore.Actor {
 		Login: "local-user",
 		Type:  "User",
 	}
-}
-
-func defaultCloseReason(reason issuecore.IssueStateReason) issuecore.IssueStateReason {
-	if strings.TrimSpace(string(reason)) == "" {
-		return issuecore.IssueStateReasonCompleted
-	}
-	return reason
-}
-
-func defaultReopenReason(reason issuecore.IssueStateReason) issuecore.IssueStateReason {
-	if strings.TrimSpace(string(reason)) == "" {
-		return issuecore.IssueStateReasonReopened
-	}
-	return reason
 }
 
 func formatIssueID(number int64) string {

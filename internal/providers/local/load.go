@@ -3,6 +3,7 @@ package local
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -240,6 +241,7 @@ func (p *Provider) loadIssueRecord(ctx context.Context, queryer dbQueryer, issue
 		COALESCE(closed_by_type, ''),
 		COALESCE(closed_by_url, ''),
 		COALESCE(closed_by_html_url, ''),
+		COALESCE(dispatch_json, ''),
 		COALESCE(provider_raw_json, '')
 	FROM issues
 	WHERE issue_id = ?`
@@ -276,6 +278,7 @@ func (p *Provider) loadIssueRecord(ctx context.Context, queryer dbQueryer, issue
 		&record.ClosedByType,
 		&record.ClosedByURL,
 		&record.ClosedByHTMLURL,
+		&record.DispatchJSON,
 		&record.ProviderRawJSON,
 	); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -738,6 +741,25 @@ func buildIssue(record issueRecord, labels []issuecore.Label, assignees []issuec
 		URL:     record.ClosedByURL,
 		HTMLURL: record.ClosedByHTMLURL,
 	})
+	issue.Dispatch, err = decodeDispatchMetadata(record.DispatchJSON)
+	if err != nil {
+		return issuecore.Issue{}, err
+	}
 
 	return issue, nil
+}
+
+func decodeDispatchMetadata(value string) (*issuecore.DispatchMetadata, error) {
+	if strings.TrimSpace(value) == "" {
+		return nil, nil
+	}
+
+	var metadata issuecore.DispatchMetadata
+	if err := json.Unmarshal([]byte(value), &metadata); err != nil {
+		return nil, err
+	}
+	if err := metadata.Validate(); err != nil {
+		return nil, err
+	}
+	return &metadata, nil
 }

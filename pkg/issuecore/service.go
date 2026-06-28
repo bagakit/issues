@@ -4,15 +4,22 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 )
 
 type Service struct {
 	providers map[string]Provider
+	dispatch  DispatchGateway
 }
 
 func NewService(providers ...Provider) (*Service, error) {
+	return NewServiceWithDispatch(nil, providers...)
+}
+
+func NewServiceWithDispatch(dispatch DispatchGateway, providers ...Provider) (*Service, error) {
 	svc := &Service{
 		providers: map[string]Provider{},
+		dispatch:  dispatch,
 	}
 
 	for _, provider := range providers {
@@ -163,6 +170,63 @@ func (s *Service) RenderPrompt(ctx context.Context, provider string, locator Iss
 	return RenderIssuePrompt(issue, options), nil
 }
 
+func (s *Service) ListDispatchTargets(ctx context.Context, provider string, locator IssueLocator) ([]DispatchTargetGroup, error) {
+	if s.dispatch == nil {
+		return nil, fmt.Errorf("dispatch gateway is not configured")
+	}
+
+	backend, err := s.provider(provider, "dispatch_targets")
+	if err != nil {
+		return nil, err
+	}
+
+	issue, err := backend.GetIssue(ctx, withProvider(locator, provider))
+	if err != nil {
+		return nil, err
+	}
+
+	return s.dispatch.ListDispatchTargets(ctx, normalizeIssue(issue, provider))
+}
+
+func (s *Service) SubmitDispatch(ctx context.Context, provider string, request DispatchRequest) (DispatchResult, error) {
+	if s.dispatch == nil {
+		return DispatchResult{}, fmt.Errorf("dispatch gateway is not configured")
+	}
+
+	backend, err := s.provider(provider, "dispatch")
+	if err != nil {
+		return DispatchResult{}, err
+	}
+
+	issue, err := backend.GetIssue(ctx, withProvider(request.Issue, provider))
+	if err != nil {
+		return DispatchResult{}, err
+	}
+	issue = normalizeIssue(issue, provider)
+
+	request = normalizeDispatchRequest(issue, request)
+	if err := request.Validate(); err != nil {
+		return DispatchResult{}, InvalidInput(provider, "dispatch", err)
+	}
+	result, err := s.dispatch.SubmitDispatch(ctx, issue, request)
+	if err != nil {
+		return DispatchResult{}, err
+	}
+
+	result, err = normalizeDispatchResult(request, result)
+	if err != nil {
+		return DispatchResult{}, fmt.Errorf("dispatch result is invalid: %w", err)
+	}
+
+	if recorder, ok := backend.(DispatchRecorder); ok {
+		if _, err := recorder.RecordDispatch(ctx, request.Issue, result.Record); err != nil {
+			return DispatchResult{}, err
+		}
+	}
+
+	return result, nil
+}
+
 func (s *Service) provider(name, operation string) (Provider, error) {
 	if name == "" {
 		return nil, ProviderRequiredError(operation)
@@ -187,4 +251,82 @@ func normalizeIssue(issue Issue, provider string) Issue {
 		issue.Provider = provider
 	}
 	return issue
+}
+
+func normalizeDispatchRequest(issue Issue, request DispatchRequest) DispatchRequest {
+	if request.Issue.Provider == "" {
+		request.Issue.Provider = issue.Provider
+	}
+	if request.Issue.Repository == "" {
+		request.Issue.Repository = issue.Repository
+	}
+	if request.Issue.ID == "" {
+		request.Issue.ID = issue.ID
+	}
+	if request.Issue.Number == 0 {
+		request.Issue.Number = issue.Number
+	}
+	request.IssueContext = mergeIssueContextLink(NewIssueContextLink(issue, ContextFormatJSON), request.IssueContext)
+	return request
+}
+
+func normalizeDispatchResult(request DispatchRequest, result DispatchResult) (DispatchResult, error) {
+	result.Record.TargetGroup = mergeDispatchTargetGroup(request.TargetGroup, result.Record.TargetGroup)
+	result.Record.Terminal = mergeDispatchTerminal(request.Terminal, result.Record.Terminal)
+	result.Record.IssueContext = mergeIssueContextLink(request.IssueContext, result.Record.IssueContext)
+	if err := result.Record.Validate(); err != nil {
+		return DispatchResult{}, err
+	}
+	return result, nil
+}
+
+func mergeIssueContextLink(base, override IssueContextLink) IssueContextLink {
+	if strings.TrimSpace(override.SchemaVersion) != "" {
+		base.SchemaVersion = override.SchemaVersion
+	}
+	if override.Format != "" {
+		base.Format = override.Format
+	}
+	if strings.TrimSpace(override.Provider) != "" {
+		base.Provider = override.Provider
+	}
+	if strings.TrimSpace(override.Repository) != "" {
+		base.Repository = override.Repository
+	}
+	if strings.TrimSpace(override.IssueID) != "" {
+		base.IssueID = override.IssueID
+	}
+	if override.IssueNumber > 0 {
+		base.IssueNumber = override.IssueNumber
+	}
+	if strings.TrimSpace(override.HTMLURL) != "" {
+		base.HTMLURL = override.HTMLURL
+	}
+	return base
+}
+
+func mergeDispatchTargetGroup(base, override DispatchTargetGroup) DispatchTargetGroup {
+	if strings.TrimSpace(override.ID) == "" {
+		override.ID = base.ID
+	}
+	if strings.TrimSpace(override.Name) == "" {
+		override.Name = base.Name
+	}
+	if len(override.Terminals) == 0 {
+		override.Terminals = base.Terminals
+	}
+	return override
+}
+
+func mergeDispatchTerminal(base, override DispatchTerminal) DispatchTerminal {
+	if override.Mode == "" {
+		return base
+	}
+	if override.Existing == nil {
+		override.Existing = base.Existing
+	}
+	if override.New == nil {
+		override.New = base.New
+	}
+	return override
 }

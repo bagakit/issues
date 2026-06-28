@@ -7,7 +7,8 @@ top of it. Karp is one client of that core. It does not own issue truth.
 
 - `pkg/issuecore`
   - GitHub-shaped issue, comment, timeline, PR-link, context, and dispatch
-    types.
+    types plus the dispatch gateway and recorder contracts used by the shared
+    service boundary.
   - Stable service boundary that works for the direct CLI now and future daemon,
     wrapper, or MCP surfaces later.
 - `internal/providers/local`
@@ -29,9 +30,14 @@ top of it. Karp is one client of that core. It does not own issue truth.
   agents and future dispatch adapters.
 - Context output keeps GitHub-like issue identity and metadata while marking
   issue body and comment text as untrusted user content.
-- Dispatch types in `pkg/issuecore` define target groups, terminal reuse vs new
-  terminal creation, new-terminal runtime selection, dispatch outcome, and the
-  link to the issue context packet used for the dispatch.
+- Dispatch types in `pkg/issuecore` define target groups with optional existing
+  terminal candidates, terminal reuse vs new terminal creation, new-terminal
+  runtime selection, dispatch outcome, and the link to the issue context packet
+  used for the dispatch.
+- `issuecore.Service` also exposes provider-agnostic dispatch target listing
+  and dispatch submission. Dispatch submission records returned dispatch facts
+  back into issue truth through the provider recorder path when the provider
+  supports it.
 
 ## Adapter Responsibilities
 

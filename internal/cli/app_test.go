@@ -472,3 +472,107 @@ func TestRunContextJSONIncludesTrustBoundaryAndTruncation(t *testing.T) {
 		t.Fatalf("prompt output missing truncation detail: %q", promptOut)
 	}
 }
+
+func TestRunEditAllowsExplicitClearOfBodyLabelsAndAssignees(t *testing.T) {
+	t.Parallel()
+
+	app, err := New("test-build")
+	if err != nil {
+		t.Fatalf("new app: %v", err)
+	}
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	app.Stdout = &stdout
+	app.Stderr = &stderr
+
+	dbPath := filepath.Join(t.TempDir(), "issues.db")
+
+	run := func(args ...string) []byte {
+		t.Helper()
+		stdout.Reset()
+		stderr.Reset()
+
+		argv := append([]string{"--db", dbPath}, args...)
+		code := app.Run(context.Background(), argv)
+		if code != 0 {
+			t.Fatalf("run %v: exit=%d stderr=%q stdout=%q", args, code, stderr.String(), stdout.String())
+		}
+
+		return append([]byte(nil), stdout.Bytes()...)
+	}
+
+	run("create", "--title", "clear me", "--body", "body", "--labels", "alpha,beta", "--assignees", "alice,bob", "--json")
+
+	editOut := run("edit", "--json", "--body", "", "--labels", "", "--assignees", "", "1")
+	var editPayload struct {
+		Issue struct {
+			Body   string `json:"body"`
+			Labels []struct {
+				Name string `json:"name"`
+			} `json:"labels"`
+			Assignees []struct {
+				Login string `json:"login"`
+			} `json:"assignees"`
+		} `json:"issue"`
+	}
+	if err := json.Unmarshal(editOut, &editPayload); err != nil {
+		t.Fatalf("decode edit output: %v", err)
+	}
+	if editPayload.Issue.Body != "" {
+		t.Fatalf("expected empty body after clear, got %q", editPayload.Issue.Body)
+	}
+	if len(editPayload.Issue.Labels) != 0 {
+		t.Fatalf("expected labels cleared, got %+v", editPayload.Issue.Labels)
+	}
+	if len(editPayload.Issue.Assignees) != 0 {
+		t.Fatalf("expected assignees cleared, got %+v", editPayload.Issue.Assignees)
+	}
+
+	viewOut := run("view", "--json", "1")
+	var viewPayload struct {
+		Issue struct {
+			Body   string `json:"body"`
+			Labels []struct {
+				Name string `json:"name"`
+			} `json:"labels"`
+			Assignees []struct {
+				Login string `json:"login"`
+			} `json:"assignees"`
+		} `json:"issue"`
+	}
+	if err := json.Unmarshal(viewOut, &viewPayload); err != nil {
+		t.Fatalf("decode view output: %v", err)
+	}
+	if viewPayload.Issue.Body != "" || len(viewPayload.Issue.Labels) != 0 || len(viewPayload.Issue.Assignees) != 0 {
+		t.Fatalf("clear did not persist: %+v", viewPayload.Issue)
+	}
+}
+
+func TestRunEditDoesNotExposeStateReasonFlag(t *testing.T) {
+	t.Parallel()
+
+	app, err := New("test-build")
+	if err != nil {
+		t.Fatalf("new app: %v", err)
+	}
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	app.Stdout = &stdout
+	app.Stderr = &stderr
+
+	dbPath := filepath.Join(t.TempDir(), "issues.db")
+	code := app.Run(context.Background(), []string{
+		"--db", dbPath,
+		"edit",
+		"--state-reason", "completed",
+		"1",
+	})
+	if code != 2 {
+		t.Fatalf("expected flag parse failure, got %d with stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "flag provided but not defined: -state-reason") {
+		t.Fatalf("unexpected stderr: %q", stderr.String())
+	}
+}

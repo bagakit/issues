@@ -34,11 +34,6 @@ var (
 		issuecore.IssueStateFilterClosed: true,
 		issuecore.IssueStateFilterAll:    true,
 	}
-	validCloseReasons = map[issuecore.IssueStateReason]bool{
-		issuecore.IssueStateReasonCompleted:  true,
-		issuecore.IssueStateReasonDuplicate:  true,
-		issuecore.IssueStateReasonNotPlanned: true,
-	}
 )
 
 type Config struct {
@@ -370,9 +365,9 @@ func (p *Provider) PlanCloseIssue(locator issuecore.IssueLocator, input issuecor
 	if err != nil {
 		return RequestPlan{}, err
 	}
-	reason := defaultCloseReason(input.Reason)
-	if !validCloseReasons[reason] {
-		return RequestPlan{}, p.operationError("close", "invalid_argument", fmt.Errorf("unsupported close reason %q", reason))
+	reason, err := issuecore.NormalizeCloseStateReason(input.Reason)
+	if err != nil {
+		return RequestPlan{}, p.operationError("close", "invalid_argument", err)
 	}
 
 	u := p.endpointURL("repos/" + url.PathEscape(repo.Owner) + "/" + url.PathEscape(repo.Repo) + "/issues/" + strconv.Itoa(number))
@@ -387,9 +382,9 @@ func (p *Provider) PlanReopenIssue(locator issuecore.IssueLocator, input issueco
 	if err != nil {
 		return RequestPlan{}, err
 	}
-	reason := defaultReopenReason(input.Reason)
-	if reason != issuecore.IssueStateReasonReopened {
-		return RequestPlan{}, p.operationError("reopen", "invalid_argument", fmt.Errorf("unsupported reopen reason %q", reason))
+	reason, err := issuecore.NormalizeReopenStateReason(input.Reason)
+	if err != nil {
+		return RequestPlan{}, p.operationError("reopen", "invalid_argument", err)
 	}
 
 	u := p.endpointURL("repos/" + url.PathEscape(repo.Owner) + "/" + url.PathEscape(repo.Repo) + "/issues/" + strconv.Itoa(number))
@@ -1048,20 +1043,6 @@ func normalizeSet(values []string) []string {
 	}
 	sort.Strings(out)
 	return out
-}
-
-func defaultCloseReason(reason issuecore.IssueStateReason) issuecore.IssueStateReason {
-	if strings.TrimSpace(string(reason)) == "" {
-		return issuecore.IssueStateReasonCompleted
-	}
-	return reason
-}
-
-func defaultReopenReason(reason issuecore.IssueStateReason) issuecore.IssueStateReason {
-	if strings.TrimSpace(string(reason)) == "" {
-		return issuecore.IssueStateReasonReopened
-	}
-	return reason
 }
 
 func scalarID(raw json.RawMessage) string {

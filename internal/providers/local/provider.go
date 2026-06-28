@@ -214,6 +214,9 @@ func (p *Provider) UpdateIssue(ctx context.Context, locator issuecore.IssueLocat
 	if emptyIssuePatch(patch) {
 		return issuecore.Issue{}, p.operationError("update", "invalid_argument", errors.New("issue patch requires at least one field"))
 	}
+	if patch.StateReason != nil {
+		return issuecore.Issue{}, p.operationError("update", "invalid_argument", errors.New("local provider only accepts state_reason via close or reopen"))
+	}
 
 	db, err := p.ensureDB(ctx, "update", p.path, p.now)
 	if err != nil {
@@ -238,8 +241,7 @@ func (p *Provider) UpdateIssue(ctx context.Context, locator issuecore.IssueLocat
 
 	title := record.Title
 	body := record.Body
-	stateReason := record.StateReason
-	changedFields := make([]string, 0, 5)
+	changedFields := make([]string, 0, 4)
 
 	if patch.Title != nil {
 		title = strings.TrimSpace(*patch.Title)
@@ -252,10 +254,6 @@ func (p *Provider) UpdateIssue(ctx context.Context, locator issuecore.IssueLocat
 		body = normalizeBody(*patch.Body)
 		changedFields = append(changedFields, "body")
 	}
-	if patch.StateReason != nil {
-		stateReason = strings.TrimSpace(string(*patch.StateReason))
-		changedFields = append(changedFields, "state_reason")
-	}
 
 	now := p.now().UTC()
 	_, err = tx.ExecContext(
@@ -266,7 +264,7 @@ func (p *Provider) UpdateIssue(ctx context.Context, locator issuecore.IssueLocat
 		title,
 		body,
 		body,
-		stateReason,
+		record.StateReason,
 		formatTime(now),
 		key.IssueID,
 	)
@@ -298,7 +296,7 @@ func (p *Provider) UpdateIssue(ctx context.Context, locator issuecore.IssueLocat
 		Labels:        labels,
 		Assignees:     assignees,
 		ChangedFields: changedFields,
-		Reason:        stateReason,
+		Reason:        record.StateReason,
 	})
 	if err != nil {
 		return issuecore.Issue{}, p.operationError("update", "storage_error", err)
@@ -400,11 +398,85 @@ func (p *Provider) AddComment(ctx context.Context, locator issuecore.IssueLocato
 }
 
 func (p *Provider) CloseIssue(ctx context.Context, locator issuecore.IssueLocator, input issuecore.CloseIssueInput) (issuecore.Issue, error) {
-	return p.changeState(ctx, "close", locator, issuecore.IssueStateClosed, defaultCloseReason(input.Reason))
+	reason, err := issuecore.NormalizeCloseStateReason(input.Reason)
+	if err != nil {
+		return issuecore.Issue{}, p.operationError("close", "invalid_argument", err)
+	}
+	return p.changeState(ctx, "close", locator, issuecore.IssueStateClosed, reason)
 }
 
 func (p *Provider) ReopenIssue(ctx context.Context, locator issuecore.IssueLocator, input issuecore.ReopenIssueInput) (issuecore.Issue, error) {
-	return p.changeState(ctx, "reopen", locator, issuecore.IssueStateOpen, defaultReopenReason(input.Reason))
+	reason, err := issuecore.NormalizeReopenStateReason(input.Reason)
+	if err != nil {
+		return issuecore.Issue{}, p.operationError("reopen", "invalid_argument", err)
+	}
+	return p.changeState(ctx, "reopen", locator, issuecore.IssueStateOpen, reason)
+}
+
+func (p *Provider) RecordDispatch(ctx context.Context, locator issuecore.IssueLocator, record issuecore.DispatchRecord) (issuecore.Issue, error) {
+	if err := record.Validate(); err != nil {
+		return issuecore.Issue{}, p.operationError("dispatch", "invalid_argument", err)
+	}
+
+	db, err := p.ensureDB(ctx, "dispatch", p.path, p.now)
+	if err != nil {
+		return issuecore.Issue{}, err
+	}
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return issuecore.Issue{}, p.operationError("dispatch", "storage_error", err)
+	}
+	defer tx.Rollback()
+
+	key, err := p.resolveIssue(ctx, tx, "dispatch", locator)
+	if err != nil {
+		return issuecore.Issue{}, err
+	}
+
+	issue, err := p.loadIssueByID(ctx, tx, key.IssueID, false)
+	if err != nil {
+		return issuecore.Issue{}, err
+	}
+
+	metadata := &issuecore.DispatchMetadata{}
+	if issue.Dispatch != nil {
+		metadata = issue.Dispatch
+	}
+	metadata.Records = append(metadata.Records, record)
+	latest := record
+	metadata.Latest = &latest
+	if err := metadata.Validate(); err != nil {
+		return issuecore.Issue{}, p.operationError("dispatch", "storage_error", err)
+	}
+
+	dispatchJSON, err := marshalJSON(metadata)
+	if err != nil {
+		return issuecore.Issue{}, p.operationError("dispatch", "storage_error", err)
+	}
+
+	now := p.now().UTC()
+	if _, err := tx.ExecContext(
+		ctx,
+		`UPDATE issues
+		 SET dispatch_json = NULLIF(?, ''), updated_at = ?
+		 WHERE issue_id = ?`,
+		dispatchJSON,
+		formatTime(now),
+		key.IssueID,
+	); err != nil {
+		return issuecore.Issue{}, p.operationError("dispatch", "storage_error", err)
+	}
+
+	issue, err = p.loadIssueByID(ctx, tx, key.IssueID, true)
+	if err != nil {
+		return issuecore.Issue{}, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return issuecore.Issue{}, p.operationError("dispatch", "storage_error", err)
+	}
+	return issue, nil
 }
 
 func (p *Provider) Export(ctx context.Context) (Snapshot, error) {

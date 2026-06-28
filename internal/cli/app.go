@@ -324,7 +324,6 @@ func (a *App) runEdit(ctx context.Context, args []string) int {
 	body := flags.String("body", "", "issue body")
 	labels := flags.String("labels", "", "comma-separated labels")
 	assignees := flags.String("assignees", "", "comma-separated assignee logins")
-	stateReason := flags.String("state-reason", "", "state reason")
 	jsonOut := flags.Bool("json", false, "render JSON")
 	if err := flags.Parse(args); err != nil {
 		return 2
@@ -334,12 +333,21 @@ func (a *App) runEdit(ctx context.Context, args []string) int {
 		return a.renderError(*jsonOut, fmt.Errorf("edit requires exactly one issue identifier"))
 	}
 
+	visited := visitedFlags(flags)
 	patch := issuecore.IssuePatch{
-		Title:       stringPtr(*title),
-		Body:        stringPtr(*body),
-		Labels:      csvPtr(*labels),
-		Assignees:   csvPtr(*assignees),
-		StateReason: stateReasonPtr(*stateReason),
+		Title: stringPtr(*title),
+	}
+	if visited["body"] {
+		bodyValue := *body
+		patch.Body = &bodyValue
+	}
+	if visited["labels"] {
+		labelsValue := splitCSV(*labels)
+		patch.Labels = &labelsValue
+	}
+	if visited["assignees"] {
+		assigneesValue := splitCSV(*assignees)
+		patch.Assignees = &assigneesValue
 	}
 
 	if patch.Title == nil && patch.Body == nil && patch.Labels == nil && patch.Assignees == nil && patch.StateReason == nil {
@@ -632,28 +640,12 @@ func splitCSV(value string) []string {
 	return out
 }
 
-func csvPtr(value string) *[]string {
-	items := splitCSV(value)
-	if len(items) == 0 {
-		return nil
-	}
-	return &items
-}
-
 func stringPtr(value string) *string {
 	if strings.TrimSpace(value) == "" {
 		return nil
 	}
 	copy := value
 	return &copy
-}
-
-func stateReasonPtr(value string) *issuecore.IssueStateReason {
-	if strings.TrimSpace(value) == "" {
-		return nil
-	}
-	reason := issuecore.IssueStateReason(value)
-	return &reason
 }
 
 func parseLocator(repository, value string) issuecore.IssueLocator {
@@ -739,6 +731,14 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func visitedFlags(flags *flag.FlagSet) map[string]bool {
+	visited := map[string]bool{}
+	flags.Visit(func(f *flag.Flag) {
+		visited[f.Name] = true
+	})
+	return visited
 }
 
 func (a *App) resolveService(options globalOptions) (*issuecore.Service, func(), error) {
